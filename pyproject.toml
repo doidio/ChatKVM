@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chatkvm"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.13"
+dependencies = [
+    "mcp>=2.2.0",
+    "streamlit>=1.63.0",
+    "watchdog>=6.0.0",
+]
+
+[project.scripts]
+chatkvm = "chatkvm.__main__:main"
