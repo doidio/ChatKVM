@@ -9,6 +9,7 @@ description = ""
 requires-python = ">=3.13"
 dependencies = [
     "mcp>=2.2.0",
+    "ollama>=0.6.2",
     "streamlit>=1.63.0",
     "watchdog>=6.0.0",
 ]
