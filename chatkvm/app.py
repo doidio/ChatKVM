@@ -3,8 +3,8 @@ import tomllib
 from pathlib import Path
 
 import httpx
+import ollama
 import streamlit as st
-from ollama import Client, RequestError, ResponseError
 
 from chatkvm import AwesunMcp
 
@@ -32,8 +32,8 @@ def get_awesun_mcp(path: str) -> AwesunMcp:
 
 
 @st.cache_resource(show_spinner=False)
-def get_ollama_client(host: str) -> Client:
-    return Client(host=host, timeout=300.0)
+def get_ollama_client(host: str) -> ollama.Client:
+    return ollama.Client(host=host, timeout=300.0)
 
 
 awesun_mcp = get_awesun_mcp(args.config)
@@ -47,8 +47,10 @@ if "messages" not in st.session_state:
 
 for item in st.session_state.messages:
     with st.chat_message(item["role"]):
+        if item.get("images"):
+            for image in item["images"]:
+                st.image(image)
         st.markdown(item["content"])
-
 
 # 设备发现
 devices = awesun_mcp.search_devices().get("devices") or []
@@ -60,53 +62,57 @@ kvms = {
 }
 
 if not kvms:
-    st.sidebar.warning("设备列表为空")
+    st.sidebar.caption("⚠️ 无可用设备")
     st.stop()
 
 labels = {
     remote_id: device.get("name") or device.get("pc_name") or str(remote_id)
     for remote_id, device in kvms.items()
 }
-remote_id = st.sidebar.radio("设备列表", list(kvms), format_func=labels.__getitem__)
+remote_id = st.sidebar.radio("可用设备", list(kvms), format_func=labels.__getitem__)
 
 if not kvms[remote_id].get("online"):
-    st.sidebar.warning("设备离线")
+    st.sidebar.caption("⚠️ 离线")
     st.stop()
 
-# 屏幕快照
-with st.sidebar.spinner("正在获取屏幕"):
-    session_id = awesun_mcp.ensure_view_session(remote_id)
-    screen = awesun_mcp.take_screenshot(session_id)
-
-if screen:
-    screen = Path(screen)
-    st.sidebar.image(screen, caption=screen.name, width="stretch")
-    for path in screen.parent.glob("awesun_*.jpg"):
-        if path != screen:
-            path.unlink(missing_ok=True)
-else:
-    st.sidebar.warning("无法获取屏幕")
-    st.stop()
-
-# 对话
+# 聊天
 if not st.session_state.messages or st.sidebar.button("新聊天", width="stretch"):
     del st.session_state.messages
     st.rerun()
 
+try:
+    caps = " ".join(ollama_client.show(ollama_vlm).capabilities)
+    st.sidebar.caption(f"✅ {ollama_vlm}\n\n{caps}")
+except ollama.ResponseError:
+    st.sidebar.caption(f"⚠️ {ollama_vlm} 无响应")
+    st.stop()
+
+# 输入
 prompt = st.chat_input("随心输入")
+
 if prompt:
-    with st.spinner("正在获取屏幕"):
+    screen = None
+
+    while screen is None:
         session_id = awesun_mcp.ensure_view_session(remote_id)
         screen = awesun_mcp.take_screenshot(session_id)
-        st.session_state.screen = screen
-        st.session_state.view_session_id = session_id
+
+    screen = Path(screen)
+    for path in screen.parent.glob("awesun_*.jpg"):
+        if path != screen:
+            path.unlink(missing_ok=True)
 
     history = st.session_state.messages
+    messages = []
     for item in history:
-        item.pop("images", None)  # 聊天记录不保存屏幕图像
-    history.append({"role": "user", "content": prompt, "images": [screen]})
+        messages.append({"role": item["role"], "content": item["content"]})
+    messages.append(
+        {"role": "user", "content": prompt, "images": [screen.read_bytes()]}
+    )
+    history.append(messages[-1])
 
     with st.chat_message("user"):
+        st.image(screen)
         st.markdown(prompt)
     with st.chat_message("assistant"):
         try:
@@ -115,18 +121,18 @@ if prompt:
                     text
                     for chunk in ollama_client.chat(
                         model=ollama_vlm,
-                        messages=history,
+                        messages=messages,
                         stream=True,
                         think=False,
                         keep_alive="10m",
                     )
                     if (text := chunk.message.content)
                 )
-        except (RequestError, ResponseError, httpx.HTTPError) as exc:
+        except (ollama.RequestError, ollama.ResponseError, httpx.HTTPError) as exc:
             try:
                 names = [item.model for item in ollama_client.list().models]
                 available = ", ".join(names) or "无"
-            except (RequestError, ResponseError, httpx.HTTPError):
+            except (ollama.RequestError, ollama.ResponseError, httpx.HTTPError):
                 available = "无法查询"
             reply = f"调用 Ollama 失败：{exc}\n\n当前服务 {ollama_host} 已有模型：{available}"
             st.error(reply)

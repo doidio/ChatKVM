@@ -159,6 +159,7 @@ class AwesunMcp:
         while time.monotonic() < deadline:
             last = self.call_tool("control_connect_state", {"session_id": session_id})
             if isinstance(last, dict) and last.get("state") == "success":
+                time.sleep(1)  # 避免远控连接后立刻截图的绿屏错误
                 return last
             time.sleep(1)
         raise TimeoutError(f"远控会话未就绪: {last!r}")
