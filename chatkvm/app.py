@@ -1,4 +1,5 @@
 import argparse
+import time
 import tomllib
 from pathlib import Path
 
@@ -6,7 +7,15 @@ import httpx
 import ollama
 import streamlit as st
 
-from chatkvm import AwesunMcp
+from chatkvm.history import History
+from chatkvm.mcp_awesun import McpAwesun
+
+ROLES = {
+    "user": {"label": "用户", "avatar": ":material/person:"},
+    "assistant": {"label": "智能", "avatar": ":material/smart_toy:"},
+    "tool": {"label": "工具", "avatar": ":material/build:"},
+    "screen": {"label": "屏幕", "avatar": ":material/desktop_windows:"},
+}
 
 st.set_page_config(
     page_title="ChatKVM", layout="centered", initial_sidebar_state="expanded"
@@ -22,13 +31,23 @@ args = parser.parse_args()
 cfg = tomllib.loads(Path(args.config).read_text())
 ollama_vlm = cfg["ollama"]["vlm"]
 ollama_host = cfg["ollama"]["host"]
+coord_max = int(cfg["ollama"].get("coord_max", 1000))
+
+SYSTEM = f"""
+你在远程操作一台电脑，你做过的操作都在上文记录保留。
+每轮只看最新全屏图。先读画面再行动；标题、菜单、对话框与目标不符就改策略。没有工具时用文字回答，不要假装操作。
+坐标是 0 到 {coord_max} 的相对值，原点左上；x 和 y 各写一个数字。
+一次只做一步。单击、双击、右键、拖动、输入怎么用看工具说明。结果以最新截图为准。
+目标界面一旦出现就停手，完整抄下需要的信息。
+文本回答的语言与用户一致。
+"""
 
 # 全局资源
 
 
 @st.cache_resource(show_spinner="Connecting AweSun MCP")
-def get_awesun_mcp(path: str) -> AwesunMcp:
-    return AwesunMcp.connect(path=path)
+def get_mcp_awesun(path: str) -> McpAwesun:
+    return McpAwesun.connect(path=path)
 
 
 @st.cache_resource(show_spinner=False)
@@ -36,24 +55,62 @@ def get_ollama_client(host: str) -> ollama.Client:
     return ollama.Client(host=host, timeout=300.0)
 
 
-awesun_mcp = get_awesun_mcp(args.config)
+mcp_awesun = get_mcp_awesun(args.config)
 ollama_client = get_ollama_client(ollama_host)
+history = History.current()
+
+
+def _note(item: dict) -> str:
+    at = str(item.get("at") or "")
+    ms = item.get("ms")
+    if ms is None:
+        return at
+    n = int(ms)
+    if n < 1000:
+        duration = f"{n}ms"
+    else:
+        seconds = n / 1000
+        duration = f"{seconds:.1f}s" if seconds < 10 else f"{seconds:.0f}s"
+    return f"{at} · {duration}" if at else duration
+
+
+def show(item: dict) -> None:
+    role = item.get("role") or ""
+    spec = ROLES.get(role) or {}
+    note = _note(item)
+    label = spec.get("label") or role
+    stamp = f"{label} {note}".strip() if note else label
+    avatar = spec.get("avatar")
+    if role == "tool":
+        with st.chat_message("tool", avatar=avatar):
+            st.caption(stamp)
+            if item.get("content"):
+                st.caption(item["content"])
+            if item.get("image"):
+                st.image(str(history.resolve(item["image"])), width=220)
+        return
+    with st.chat_message(role, avatar=avatar):
+        st.caption(stamp)
+        if item.get("content"):
+            st.markdown(item["content"])
+        for call in item.get("tool_calls") or []:
+            function = call["function"]
+            st.caption(f":material/build: {function['name']} {function['arguments']}")
+        if item.get("image"):
+            st.image(str(history.resolve(item["image"])))
+
 
 # 聊天记录
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "你好，应该做点什么？"}
-    ]
-
-for item in st.session_state.messages:
-    with st.chat_message(item["role"]):
-        if item.get("images"):
-            for image in item["images"]:
-                st.image(image)
-        st.markdown(item["content"])
+rows = history.load()
+if not rows:
+    with st.chat_message("assistant", avatar=ROLES["assistant"]["avatar"]):
+        st.markdown("你好，应该做点什么？")
+else:
+    for item in rows:
+        show(item)
 
 # 设备发现
-devices = awesun_mcp.search_devices().get("devices") or []
+devices = mcp_awesun.search_devices().get("devices") or []
 
 kvms = {
     int(device["remote_id"]): device
@@ -75,9 +132,8 @@ if not kvms[remote_id].get("online"):
     st.sidebar.caption("⚠️ 离线")
     st.stop()
 
-# 聊天
-if not st.session_state.messages or st.sidebar.button("新聊天", width="stretch"):
-    del st.session_state.messages
+if st.sidebar.button("新聊天", width="stretch"):
+    History.rotate()
     st.rerun()
 
 try:
@@ -87,54 +143,120 @@ except ollama.ResponseError:
     st.sidebar.caption(f"⚠️ {ollama_vlm} 无响应")
     st.stop()
 
-# 输入
-prompt = st.chat_input("随心输入")
+st.sidebar.caption(f"📁 {history.folder}")
+
+with st.bottom:
+    with st.container(
+        horizontal=True,
+        horizontal_alignment="center",
+        vertical_alignment="center",
+        wrap=False,
+        gap="small",
+    ):
+        with_tools = st.checkbox(
+            "允许操控",
+            True,
+            key="with_tools",
+            help="自主操控循环上限",
+        )
+        max_steps = st.radio(
+            "操控上限",
+            [10, 25, 50],
+            key="max_steps_tier",
+            disabled=not with_tools,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+    prompt = st.chat_input("随心输入")
 
 if prompt:
-    screen = None
+    tools = {tool.__name__: tool for tool in mcp_awesun.agent_tools}
+    show(history.append("user", content=prompt))
 
-    while screen is None:
-        session_id = awesun_mcp.ensure_view_session(remote_id)
-        screen = awesun_mcp.take_screenshot(session_id)
+    with st.spinner("正在连接设备"):
+        started = time.monotonic()
+        mcp_awesun.use(remote_id)
+        screen = mcp_awesun.screenshot()
+    image = history.save_image("screen", screen)
+    show(history.append("screen", image=image, started=started))
 
-    screen = Path(screen)
-    for path in screen.parent.glob("awesun_*.jpg"):
-        if path != screen:
-            path.unlink(missing_ok=True)
-
-    history = st.session_state.messages
-    messages = []
-    for item in history:
-        messages.append({"role": item["role"], "content": item["content"]})
-    messages.append(
-        {"role": "user", "content": prompt, "images": [screen.read_bytes()]}
-    )
-    history.append(messages[-1])
-
-    with st.chat_message("user"):
-        st.image(screen)
-        st.markdown(prompt)
-    with st.chat_message("assistant"):
+    for _ in range(1 if not with_tools else int(max_steps or 10)):
+        messages = history.ollama_messages(SYSTEM)
+        started = time.monotonic()
         try:
             with st.spinner("正在思考"):
-                reply = st.write_stream(
-                    text
-                    for chunk in ollama_client.chat(
-                        model=ollama_vlm,
-                        messages=messages,
-                        stream=True,
-                        think=False,
-                        keep_alive="10m",
-                    )
-                    if (text := chunk.message.content)
-                )
+                payload = {
+                    "model": ollama_vlm,
+                    "messages": messages,
+                    "think": False,
+                    "keep_alive": "10m",
+                }
+                if with_tools:
+                    payload["tools"] = mcp_awesun.agent_tools
+                response = ollama_client.chat(**payload)
         except (ollama.RequestError, ollama.ResponseError, httpx.HTTPError) as exc:
-            try:
-                names = [item.model for item in ollama_client.list().models]
-                available = ", ".join(names) or "无"
-            except (ollama.RequestError, ollama.ResponseError, httpx.HTTPError):
-                available = "无法查询"
-            reply = f"调用 Ollama 失败：{exc}\n\n当前服务 {ollama_host} 已有模型：{available}"
-            st.error(reply)
-    history.append({"role": "assistant", "content": reply or ""})
+            show(
+                history.append(
+                    "assistant",
+                    content=f"调用 Ollama 失败：{exc}",
+                    started=started,
+                )
+            )
+            st.error(f"调用 Ollama 失败：{exc}")
+            break
+
+        dumped = response.message.model_dump(exclude_none=True)
+        calls = dumped.get("tool_calls") or []
+        show(
+            history.append(
+                "assistant",
+                content=dumped.get("content") or "",
+                started=started,
+                tool_calls=calls or None,
+            )
+        )
+        if not with_tools or not calls:
+            break
+
+        # 桌面操作必须串行，一步一截图，否则下一步是在旧画面上决策。
+        for call in calls:
+            name = call["function"]["name"]
+            arguments = call["function"]["arguments"]
+            started = time.monotonic()
+            peek_image = None
+            if name in {
+                "left_click",
+                "right_click",
+                "left_double_click",
+                "left_drag",
+                "scroll",
+            }:
+                px, py = arguments.get("x"), arguments.get("y")
+                if px is not None:
+                    try:
+                        peek = mcp_awesun.peek(px, py)
+                        peek_image = history.save_image("tool", peek)
+                        peek.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            with st.spinner(f"正在执行 {name}"):
+                try:
+                    result = str(tools[name](**arguments))
+                except Exception as exc:
+                    result = f"failed: {exc}"
+            show(
+                history.append(
+                    "tool",
+                    tool_name=name,
+                    content=result,
+                    started=started,
+                    image=peek_image,
+                )
+            )
+
+        with st.spinner("正在刷新画面"):
+            started = time.monotonic()
+            screen = mcp_awesun.screenshot()
+        image = history.save_image("screen", screen)
+        show(history.append("screen", image=image, started=started))
     st.rerun()
