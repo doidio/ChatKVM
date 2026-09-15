@@ -260,12 +260,7 @@ class McpAwesun:
         self.call_tool("desktop_waiting", {"duration": SETTLE_MS})
         self.screenshot()
 
-    def _to_pixels(self, x: Any, y: Any = None) -> tuple[int, int]:
-        # 模型常把坐标收成 x=[left, top]；偶发会给屏幕像素。
-        if isinstance(x, (list, tuple)) and len(x) >= 2:
-            x, y = x[0], x[1]
-        if y is None:
-            raise TypeError("need both x and y")
+    def _to_pixels(self, x: Any, y: Any) -> tuple[int, int]:
         x, y = float(x), float(y)
         width, height = self._size
         scale = self.coord_max
@@ -283,7 +278,7 @@ class McpAwesun:
         my = round(y / height * scale)
         return min(max(mx, 0), scale), min(max(my, 0), scale)
 
-    def peek(self, x: Any, y: Any = None, *, size: int = 256) -> Path:
+    def peek(self, x: Any, y: Any, *, size: int = 256) -> Path:
         """从当前全屏图裁出指针目标附近，动作用来前调用。"""
         x, y = self._to_pixels(x, y)
         if self._screen is None:
@@ -339,49 +334,60 @@ class McpAwesun:
         )
         qx, qy = self._from_pixels(x, y)
         self._settle()
-        return f"{button} click x{clicks} at ({qx}, {qy})"
+        if button == "right":
+            action = "right_click"
+        elif clicks == 2:
+            action = "left_double_click"
+        else:
+            action = "left_click"
+        return (
+            f"{action} ({qx}, {qy}) on the 0-{self.coord_max} grid. "
+            "Inspect the new screenshot; if the wrong control reacted, pick another point."
+        )
 
-    def left_click(self, x: int, y: int | None = None) -> str:
-        """Left-click at (x, y). Use for buttons, links, tabs, list rows, menu items, and focusing a field.
+    def left_click(self, x: int, y: int) -> str:
+        """Left-click the control at (x, y).
+
+        Use for buttons, links, tabs, list rows, menu items, and focusing a text field.
+        Do not use this to open desktop icons, or to open a title-bar help/overflow menu.
 
         Args:
-            x: Horizontal position 0-{coord_max} from the top-left of the screenshot, or [x, y].
-            y: Vertical position 0-{coord_max}.
+            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
+            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
         """
         return self._pointer_click(x, y, button="left", clicks=1)
 
-    def right_click(self, x: int, y: int | None = None) -> str:
-        """Right-click at (x, y) to open a context menu. Then left_click the item you want.
+    def right_click(self, x: int, y: int) -> str:
+        """Right-click at (x, y) to open a context menu, then left_click the item.
+
+        Use for title-bar icons such as "?", overflow buttons, and anything whose
+        left-click is Help or another action you do not want.
 
         Args:
-            x: Horizontal position 0-{coord_max} from the top-left of the screenshot, or [x, y].
-            y: Vertical position 0-{coord_max}.
+            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
+            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
         """
         return self._pointer_click(x, y, button="right", clicks=1)
 
-    def left_double_click(self, x: int, y: int | None = None) -> str:
-        """Double left-click at (x, y). Use to open desktop icons, shortcuts, and files.
+    def left_double_click(self, x: int, y: int) -> str:
+        """Double left-click at (x, y) to open a desktop icon, shortcut, or file.
 
         Args:
-            x: Horizontal position 0-{coord_max} from the top-left of the screenshot, or [x, y].
-            y: Vertical position 0-{coord_max}.
+            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
+            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
         """
         return self._pointer_click(x, y, button="left", clicks=2)
 
-    def left_drag(
-        self,
-        x: int,
-        y: int | None = None,
-        x2: int | None = None,
-        y2: int | None = None,
-    ) -> str:
-        """Drag with the left button from (x, y) to (x2, y2). Use for sliders, selections, and window edges.
+    def left_drag(self, x: int, y: int, x2: int, y2: int) -> str:
+        """Drag with the left button from (x, y) to (x2, y2).
+
+        Use for sliders, selections, and window edges.
 
         Args:
-            x: Start horizontal position 0-{coord_max}, or [x, y] start pair.
-            y: Start vertical position 0-{coord_max}.
-            x2: End horizontal position 0-{coord_max}, or [x, y] end pair.
-            y2: End vertical position 0-{coord_max}.
+            x: Start horizontal integer 0-{coord_max}.
+            y: Start vertical integer 0-{coord_max}.
+            x2: End horizontal integer 0-{coord_max}.
+            y2: End vertical integer 0-{coord_max}.
         """
         x1, y1 = self._to_pixels(x, y)
         x2, y2 = self._to_pixels(x2, y2)
@@ -399,13 +405,18 @@ class McpAwesun:
         self._settle()
         a = self._from_pixels(x1, y1)
         b = self._from_pixels(x2, y2)
-        return f"left drag from ({a[0]}, {a[1]}) to ({b[0]}, {b[1]})"
+        return (
+            f"left_drag ({a[0]}, {a[1]}) -> ({b[0]}, {b[1]}) on the 0-{self.coord_max} grid. "
+            "Inspect the new screenshot; if it missed, change the endpoints."
+        )
 
     def type_text(self, text: str) -> str:
-        """Type into the focused field, character by character. left_click the field first.
+        """Type into the field that already has keyboard focus.
+
+        left_click the target field first. Skip this if the field already shows the intended text.
 
         Args:
-            text: Text to type. Do not repeat if the field already has the intended value.
+            text: Characters to type.
         """
         for char in text:
             if char == " ":
@@ -419,10 +430,15 @@ class McpAwesun:
             self.call_tool(
                 "desktop_press_keys", {"session_id": self.session, "keys": [key]}
             )
-        return f"typed {len(text)} chars"
+        return (
+            f"typed {len(text)} chars into the focused field. "
+            "If they landed in the wrong place, left_click the correct field next."
+        )
 
     def press_keys(self, keys: list[str]) -> str:
-        """Press a key or a shortcut. Use for Enter, Tab, arrows, and chords like Ctrl+S.
+        """Press a key or a shortcut.
+
+        Use for Enter, Tab, arrows, and chords like Ctrl+S.
 
         Args:
             keys: Keys pressed together, such as ["enter"] or ["control", "s"].
@@ -430,20 +446,16 @@ class McpAwesun:
         self.call_tool(
             "desktop_typing_keys", {"session_id": self.session, "keys": keys}
         )
-        return f"pressed {'+'.join(keys)}"
+        return f"pressed {'+'.join(keys)}. Inspect the new screenshot."
 
-    def scroll(
-        self,
-        x: int,
-        y: int | None = None,
-        direction: str = "down",
-        amount: int | None = None,
-    ) -> str:
-        """Scroll the mouse wheel at (x, y). left_click the pane first if it is not focused.
+    def scroll(self, x: int, y: int, direction: str = "down", amount: int | None = None) -> str:
+        """Scroll the mouse wheel at (x, y).
+
+        left_click the pane first if it is not focused.
 
         Args:
-            x: Horizontal position 0-{coord_max} from the top-left of the screenshot, or [x, y].
-            y: Vertical position 0-{coord_max}.
+            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
+            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
             direction: Wheel direction, up or down.
             amount: Wheel steps. Defaults to 3.
         """
@@ -460,17 +472,16 @@ class McpAwesun:
         )
         qx, qy = self._from_pixels(x, y)
         self._settle()
-        return f"scrolled {direction} x{amount} at ({qx}, {qy})"
+        return (
+            f"scroll {direction} x{amount} at ({qx}, {qy}) on the 0-{self.coord_max} grid. "
+            "Inspect the new screenshot."
+        )
 
     def wait_for_change(self, timeout: int | None = None) -> str:
         """Wait until the screen pixels change a lot compared with the last screenshot.
 
         Use only after an action that should open a window or replace the page.
-        This does not read the image; inspect the new screenshot yourself.
-        Skip after typing or focusing a field. If unchanged, try a different action.
-
-        Returns:
-            "screen changed after {ms}ms" or "screen unchanged after {ms}ms".
+        Skip after typing or focusing a field. This does not read the image.
 
         Args:
             timeout: Milliseconds to wait at most, 500 to 10000. Defaults to 3000.
@@ -483,9 +494,15 @@ class McpAwesun:
             self.screenshot()
             elapsed_ms = int((time.monotonic() - start) * 1000)
             if _differs(before, self._frame):
-                return f"screen changed after {elapsed_ms}ms"
+                return (
+                    f"screen changed after {elapsed_ms}ms. "
+                    "Read the new screenshot before the next action."
+                )
             if elapsed_ms >= limit_ms:
-                return f"screen unchanged after {limit_ms}ms"
+                return (
+                    f"screen unchanged after {limit_ms}ms. "
+                    "Do not wait again; try a different tool or coordinates."
+                )
 
     def close(self) -> None:
         if self._closed:

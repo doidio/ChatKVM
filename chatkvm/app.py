@@ -29,8 +29,8 @@ parser.add_argument("-c", "--config", default="config.toml")
 args = parser.parse_args()
 
 cfg = tomllib.loads(Path(args.config).read_text())
-ollama_vlm = cfg["ollama"]["vlm"]
 ollama_host = cfg["ollama"]["host"]
+ollama_vlm = cfg["ollama"]["vlm"]
 coord_max = int(cfg["ollama"].get("coord_max", 1000))
 
 SYSTEM = f"""
@@ -132,18 +132,12 @@ if not kvms[remote_id].get("online"):
     st.sidebar.caption("⚠️ 离线")
     st.stop()
 
+st.sidebar.caption(f"📁 {history.folder.as_posix()}")
+
 if st.sidebar.button("新聊天", width="stretch"):
     History.rotate()
     st.rerun()
 
-try:
-    caps = " ".join(ollama_client.show(ollama_vlm).capabilities)
-    st.sidebar.caption(f"✅ {ollama_vlm}\n\n{caps}")
-except ollama.ResponseError:
-    st.sidebar.caption(f"⚠️ {ollama_vlm} 无响应")
-    st.stop()
-
-st.sidebar.caption(f"📁 {history.folder}")
 
 with st.bottom:
     with st.container(
@@ -168,6 +162,13 @@ with st.bottom:
             label_visibility="collapsed",
         )
     prompt = st.chat_input("随心输入")
+
+try:
+    caps = " ".join(ollama_client.show(ollama_vlm).capabilities)
+    st.sidebar.caption(f"✅ {ollama_vlm}\n\n{caps}")
+except ollama.ResponseError:
+    st.sidebar.caption(f"⚠️ {ollama_vlm} 无响应")
+    st.stop()
 
 if prompt:
     tools = {tool.__name__: tool for tool in mcp_awesun.agent_tools}
@@ -221,7 +222,7 @@ if prompt:
         # 桌面操作必须串行，一步一截图，否则下一步是在旧画面上决策。
         for call in calls:
             name = call["function"]["name"]
-            arguments = call["function"]["arguments"]
+            arguments = call["function"].get("arguments") or {}
             started = time.monotonic()
             peek_image = None
             if name in {
