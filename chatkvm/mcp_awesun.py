@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -42,8 +42,18 @@ T = TypeVar("T")
 TIMEOUT = 60.0
 THUMBNAIL = (48, 48)
 SETTLE_MS = 500
+_HID_KEY_ALIAS = {
+    "esc": "ESCAPE",
+    "escape": "ESCAPE",
+    "backspace": "BACK",
+    "back": "BACK",
+    "return": "ENTER",
+    "del": "DELETE",
+    "spacebar": "SPACE",
+    "ctrl": "control",
+}
 
-__all__ = ["McpAwesun"]
+__all__ = ["McpAwesun", "ollama_tool_defs"]
 
 
 # --- MCP 回调：stdio 噪音过滤 ---
@@ -104,6 +114,34 @@ def _fingerprint(path: Path) -> bytes:
 def _differs(before: bytes, after: bytes) -> bool:
     pixels = sum(1 for a, b in zip(before, after) if abs(a - b) > 16)
     return pixels > 8
+
+
+def ollama_tool_defs(
+    tools: Sequence[Callable[..., Any]],
+    coord_max: int,
+) -> list[dict[str, Any]]:
+    """Ollama 从函数生成 schema 时会丢掉 enum；坐标再标成 integer。"""
+    from ollama._utils import convert_function_to_tool
+
+    defs: list[dict[str, Any]] = []
+    for fn in tools:
+        dumped = convert_function_to_tool(fn).model_dump(exclude_none=True)
+        props = (
+            dumped.get("function", {}).get("parameters", {}).get("properties") or {}
+        )
+        for key in ("x", "y", "x2", "y2"):
+            if key in props:
+                props[key]["type"] = "integer"
+                desc = str(props[key].get("description") or "").strip()
+                if str(coord_max) not in desc:
+                    props[key]["description"] = (
+                        f"{desc} Range 0-{coord_max}.".strip()
+                    )
+        if "direction" in props:
+            props["direction"]["type"] = "string"
+            props["direction"]["enum"] = ["up", "down"]
+        defs.append(dumped)
+    return defs
 
 
 @dataclass
@@ -260,8 +298,28 @@ class McpAwesun:
         self.call_tool("desktop_waiting", {"duration": SETTLE_MS})
         self.screenshot()
 
-    def _to_pixels(self, x: Any, y: Any) -> tuple[int, int]:
-        x, y = float(x), float(y)
+    def _parse_coord(self, name: str, value: Any) -> float:
+        try:
+            if isinstance(value, bool) or value is None:
+                raise TypeError(name)
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{name} must be one JSON integer 0-{self.coord_max}, such as 59. "
+                f"Got {value!r}. Put only this field's number here; "
+                "the other axis is a separate field."
+            ) from None
+
+    def _to_pixels(
+        self,
+        x: Any,
+        y: Any,
+        *,
+        x_name: str = "x",
+        y_name: str = "y",
+    ) -> tuple[int, int]:
+        x = self._parse_coord(x_name, x)
+        y = self._parse_coord(y_name, y)
         width, height = self._size
         scale = self.coord_max
         if 0 <= x <= scale and 0 <= y <= scale:
@@ -309,7 +367,7 @@ class McpAwesun:
 
     @property
     def agent_tools(self) -> tuple[Callable[..., str], ...]:
-        """自主操作设备必需的动作，直接作为 Ollama tools 传入。"""
+        """自主操作设备必需的动作。"""
         return (
             self.left_click,
             self.right_click,
@@ -320,6 +378,11 @@ class McpAwesun:
             self.scroll,
             self.wait_for_change,
         )
+
+    @property
+    def ollama_tools(self) -> list[dict[str, Any]]:
+        """Ollama 用的 JSON schema：坐标强制 integer，方向用 enum。"""
+        return ollama_tool_defs(self.agent_tools, self.coord_max)
 
     def _pointer_click(self, x: Any, y: Any, *, button: str, clicks: int) -> str:
         x, y = self._to_pixels(x, y)
@@ -342,55 +405,51 @@ class McpAwesun:
             action = "left_click"
         return (
             f"{action} ({qx}, {qy}) on the 0-{self.coord_max} grid. "
-            "Inspect the new screenshot; if the wrong control reacted, pick another point."
+            "Inspect the new screenshot."
         )
 
     def left_click(self, x: int, y: int) -> str:
-        """Left-click the control at (x, y).
+        """Left-click a control using integer parameters x and y.
 
         Use for buttons, links, tabs, list rows, menu items, and focusing a text field.
-        Do not use this to open desktop icons, or to open a title-bar help/overflow menu.
 
         Args:
-            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
-            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
+            x: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y: One JSON integer 0-{coord_max} for this field only, such as 900.
         """
         return self._pointer_click(x, y, button="left", clicks=1)
 
     def right_click(self, x: int, y: int) -> str:
-        """Right-click at (x, y) to open a context menu, then left_click the item.
-
-        Use for title-bar icons such as "?", overflow buttons, and anything whose
-        left-click is Help or another action you do not want.
+        """Right-click using integer parameters x and y to open a context menu, then left_click the item.
 
         Args:
-            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
-            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
+            x: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y: One JSON integer 0-{coord_max} for this field only, such as 900.
         """
         return self._pointer_click(x, y, button="right", clicks=1)
 
     def left_double_click(self, x: int, y: int) -> str:
-        """Double left-click at (x, y) to open a desktop icon, shortcut, or file.
+        """Double left-click using integer parameters x and y to open a desktop icon, shortcut, or file.
 
         Args:
-            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
-            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
+            x: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y: One JSON integer for this field only, such as 900.
         """
         return self._pointer_click(x, y, button="left", clicks=2)
 
     def left_drag(self, x: int, y: int, x2: int, y2: int) -> str:
-        """Drag with the left button from (x, y) to (x2, y2).
+        """Drag with the left button from integer x and y to integer x2 and y2.
 
         Use for sliders, selections, and window edges.
 
         Args:
-            x: Start horizontal integer 0-{coord_max}.
-            y: Start vertical integer 0-{coord_max}.
-            x2: End horizontal integer 0-{coord_max}.
-            y2: End vertical integer 0-{coord_max}.
+            x: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y: One JSON integer 0-{coord_max} for this field only, such as 900.
+            x2: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y2: One JSON integer 0-{coord_max} for this field only, such as 900.
         """
         x1, y1 = self._to_pixels(x, y)
-        x2, y2 = self._to_pixels(x2, y2)
+        x2, y2 = self._to_pixels(x2, y2, x_name="x2", y_name="y2")
         self.call_tool(
             "desktop_drag_mouse",
             {
@@ -407,13 +466,15 @@ class McpAwesun:
         b = self._from_pixels(x2, y2)
         return (
             f"left_drag ({a[0]}, {a[1]}) -> ({b[0]}, {b[1]}) on the 0-{self.coord_max} grid. "
-            "Inspect the new screenshot; if it missed, change the endpoints."
+            "Inspect the new screenshot."
         )
 
     def type_text(self, text: str) -> str:
         """Type into the field that already has keyboard focus.
 
-        left_click the target field first. Skip this if the field already shows the intended text.
+        left_click the field first if it is not focused. Characters are appended.
+        Skip only when the field already shows exactly this text. If it shows
+        something else, select all (for example press_keys(["control", "a"])) then type.
 
         Args:
             text: Characters to type.
@@ -432,30 +493,33 @@ class McpAwesun:
             )
         return (
             f"typed {len(text)} chars into the focused field. "
-            "If they landed in the wrong place, left_click the correct field next."
+            "Inspect the new screenshot."
         )
 
     def press_keys(self, keys: list[str]) -> str:
         """Press a key or a shortcut.
 
-        Use for Enter, Tab, arrows, and chords like Ctrl+S.
+        Use for Enter, Tab, Escape, Backspace, arrows, and chords like Ctrl+S.
 
         Args:
-            keys: Keys pressed together, such as ["enter"] or ["control", "s"].
+            keys: Keys pressed together. Spell ESCAPE, BACK, ENTER, TAB,
+                DELETE, or control plus a letter. Examples: ["ENTER"],
+                ["ESCAPE"], ["control", "a"]. Do not send esc or backspace.
         """
+        keys = [_HID_KEY_ALIAS.get(key.lower(), key) for key in keys]
         self.call_tool(
             "desktop_typing_keys", {"session_id": self.session, "keys": keys}
         )
         return f"pressed {'+'.join(keys)}. Inspect the new screenshot."
 
     def scroll(self, x: int, y: int, direction: str = "down", amount: int | None = None) -> str:
-        """Scroll the mouse wheel at (x, y).
+        """Scroll the mouse wheel using integer parameters x and y.
 
         left_click the pane first if it is not focused.
 
         Args:
-            x: Horizontal integer 0-{coord_max} from the top-left of the screenshot.
-            y: Vertical integer 0-{coord_max} from the top-left of the screenshot.
+            x: One JSON integer 0-{coord_max} for this field only, such as 59.
+            y: One JSON integer 0-{coord_max} for this field only, such as 900.
             direction: Wheel direction, up or down.
             amount: Wheel steps. Defaults to 3.
         """
@@ -501,7 +565,7 @@ class McpAwesun:
             if elapsed_ms >= limit_ms:
                 return (
                     f"screen unchanged after {limit_ms}ms. "
-                    "Do not wait again; try a different tool or coordinates."
+                    "Do not wait again; try a different action."
                 )
 
     def close(self) -> None:

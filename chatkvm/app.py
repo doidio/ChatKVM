@@ -36,8 +36,8 @@ coord_max = int(cfg["ollama"].get("coord_max", 1000))
 SYSTEM = f"""
 你在远程操作一台电脑，你做过的操作都在上文记录保留。
 每轮只看最新全屏图。先读画面再行动；标题、菜单、对话框与目标不符就改策略。没有工具时用文字回答，不要假装操作。
-坐标是 0 到 {coord_max} 的相对值，原点左上；x 和 y 各写一个数字。
-一次只做一步。单击、双击、右键、拖动、输入怎么用看工具说明。结果以最新截图为准。
+坐标是 0 到 {coord_max} 的相对值，原点左上。x 是一个 JSON 整数，y 是另一个 JSON 整数。不要把两个值写进同一个字段，不要用逗号、方括号或 y>。
+一次只做一步。调用工具时必须先写一句很短的话说明这一步做什么。单击、双击、右键、拖动、输入怎么用看工具说明。结果以最新截图为准。
 目标界面一旦出现就停手，完整抄下需要的信息。
 文本回答的语言与用户一致。
 """
@@ -193,7 +193,7 @@ if prompt:
                     "keep_alive": "10m",
                 }
                 if with_tools:
-                    payload["tools"] = mcp_awesun.agent_tools
+                    payload["tools"] = mcp_awesun.ollama_tools
                 response = ollama_client.chat(**payload)
         except (ollama.RequestError, ollama.ResponseError, httpx.HTTPError) as exc:
             show(
