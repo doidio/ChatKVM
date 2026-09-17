@@ -36,22 +36,13 @@ from mcp.types import (
 )
 from PIL import Image, ImageDraw
 
-from chatkvm import __version__
+from chatkvm import __version__, hid
 
 T = TypeVar("T")
 TIMEOUT = 60.0
 THUMBNAIL = (48, 48)
 SETTLE_MS = 500
-_HID_KEY_ALIAS = {
-    "esc": "ESCAPE",
-    "escape": "ESCAPE",
-    "backspace": "BACK",
-    "back": "BACK",
-    "return": "ENTER",
-    "del": "DELETE",
-    "spacebar": "SPACE",
-    "ctrl": "control",
-}
+TYPE_KEY_MS = 80
 
 __all__ = ["McpAwesun", "ollama_tool_defs"]
 
@@ -293,10 +284,30 @@ class McpAwesun:
         width, height = self._size
         return [min(max(x / width, 0.0), 1.0), min(max(y / height, 0.0), 1.0)]
 
+    def _path_point(self, x: int, y: int) -> str:
+        # AweSun: ['0.33,0.44', '0.55,0.66']，不是 [x,y] 数组或 JSON 数组串。
+        nx, ny = self._coordinates(x, y)
+        return f"{nx},{ny}"
+
+    def _wait(self, ms: int) -> None:
+        self.call_tool("desktop_waiting", {"duration": ms})
+
     def _settle(self) -> None:
-        """鼠标动作后等菜单/窗口画完，再截一张结果图。"""
-        self.call_tool("desktop_waiting", {"duration": SETTLE_MS})
+        """动作后等菜单/窗口画完，再截一张结果图。"""
+        self._wait(SETTLE_MS)
         self.screenshot()
+
+    def _press_hid(self, keys: list[str], *, shortcut: bool | None = None) -> None:
+        if not keys:
+            raise ValueError("keys required")
+        if shortcut is None:
+            shortcut = hid.is_shortcut(keys)
+        if shortcut:
+            keys = [key.lower() if len(key) == 1 else key for key in keys]
+        self.call_tool(
+            "desktop_typing_keys" if shortcut else "desktop_press_keys",
+            {"session_id": self.session, "keys": keys},
+        )
 
     def _parse_coord(self, name: str, value: Any) -> float:
         try:
@@ -305,7 +316,7 @@ class McpAwesun:
             return float(value)
         except (TypeError, ValueError):
             raise ValueError(
-                f"{name} must be one JSON integer 0-{self.coord_max}, such as 59. "
+                f"{name} must be one JSON integer 0-{self.coord_max}, such as 240. "
                 f"Got {value!r}. Put only this field's number here; "
                 "the other axis is a separate field."
             ) from None
@@ -409,44 +420,44 @@ class McpAwesun:
         )
 
     def left_click(self, x: int, y: int) -> str:
-        """Left-click a control using integer parameters x and y.
+        """Left-click. Example x=240 y=180.
 
         Use for buttons, links, tabs, list rows, menu items, and focusing a text field.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y: One JSON integer 0-{coord_max} for this field only, such as 900.
+            x: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y: One JSON integer 0-{coord_max} for this field only, such as 180.
         """
         return self._pointer_click(x, y, button="left", clicks=1)
 
     def right_click(self, x: int, y: int) -> str:
-        """Right-click using integer parameters x and y to open a context menu, then left_click the item.
+        """Right-click. Example x=240 y=180.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y: One JSON integer 0-{coord_max} for this field only, such as 900.
+            x: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y: One JSON integer 0-{coord_max} for this field only, such as 180.
         """
         return self._pointer_click(x, y, button="right", clicks=1)
 
     def left_double_click(self, x: int, y: int) -> str:
-        """Double left-click using integer parameters x and y to open a desktop icon, shortcut, or file.
+        """Double left-click. Example x=240 y=180.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y: One JSON integer for this field only, such as 900.
+            x: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y: One JSON integer 0-{coord_max} for this field only, such as 180.
         """
         return self._pointer_click(x, y, button="left", clicks=2)
 
     def left_drag(self, x: int, y: int, x2: int, y2: int) -> str:
-        """Drag with the left button from integer x and y to integer x2 and y2.
+        """Drag with the left button. Example x=240 y=180 x2=520 y2=180.
 
         Use for sliders, selections, and window edges.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y: One JSON integer 0-{coord_max} for this field only, such as 900.
-            x2: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y2: One JSON integer 0-{coord_max} for this field only, such as 900.
+            x: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y: One JSON integer 0-{coord_max} for this field only, such as 180.
+            x2: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y2: One JSON integer 0-{coord_max} for this field only, such as 180.
         """
         x1, y1 = self._to_pixels(x, y)
         x2, y2 = self._to_pixels(x2, y2, x_name="x2", y_name="y2")
@@ -456,8 +467,8 @@ class McpAwesun:
                 "session_id": self.session,
                 "button": "left",
                 "paths": [
-                    self._coordinates(x1, y1),
-                    self._coordinates(x2, y2),
+                    self._path_point(x1, y1),
+                    self._path_point(x2, y2),
                 ],
             },
         )
@@ -470,56 +481,47 @@ class McpAwesun:
         )
 
     def type_text(self, text: str) -> str:
-        """Type into the field that already has keyboard focus.
+        """Type into the focused field. Example text=hello, world.
 
-        left_click the field first if it is not focused. Characters are appended.
-        Skip only when the field already shows exactly this text. If it shows
-        something else, select all (for example press_keys(["control", "a"])) then type.
+        left_click the field first if it is not focused. Characters append.
+        Only ASCII letters, digits, space, and US-keyboard punctuation.
+        Other characters are rejected; the tool result lists them.
 
         Args:
-            text: Characters to type.
+            text: The string to type, such as hello, world.
         """
-        for char in text:
-            if char == " ":
-                key = "space"
-            elif char == "\n":
-                key = "enter"
-            elif char == "\t":
-                key = "tab"
-            else:
-                key = char
-            self.call_tool(
-                "desktop_press_keys", {"session_id": self.session, "keys": [key]}
-            )
-        return (
-            f"typed {len(text)} chars into the focused field. "
-            "Inspect the new screenshot."
-        )
+        text = str(text)
+        for keys in hid.chords_for_text(text):
+            self._press_hid(keys, shortcut=False)
+            self._wait(TYPE_KEY_MS)
+        self._settle()
+        return f"typed {len(text)} chars into the focused field. Inspect the new screenshot."
 
     def press_keys(self, keys: list[str]) -> str:
-        """Press a key or a shortcut.
+        """Press a key or shortcut. Example keys=["ENTER"].
 
-        Use for Enter, Tab, Escape, Backspace, arrows, and chords like Ctrl+S.
+        Use for Enter, Escape, Backspace, Tab, arrows, and chords.
+        A single US-keyboard character is mapped to that key.
+        Do not type strings here; use type_text.
 
         Args:
-            keys: Keys pressed together. Spell ESCAPE, BACK, ENTER, TAB,
-                DELETE, or control plus a letter. Examples: ["ENTER"],
-                ["ESCAPE"], ["control", "a"]. Do not send esc or backspace.
+            keys: Keys pressed together, such as ["TAB"] or ["control", "s"].
         """
-        keys = [_HID_KEY_ALIAS.get(key.lower(), key) for key in keys]
-        self.call_tool(
-            "desktop_typing_keys", {"session_id": self.session, "keys": keys}
-        )
-        return f"pressed {'+'.join(keys)}. Inspect the new screenshot."
+        if isinstance(keys, str):
+            keys = [keys]
+        shown = "+".join(str(key) for key in keys)
+        self._press_hid(hid.resolve_press(keys))
+        self._settle()
+        return f"pressed {shown}. Inspect the new screenshot."
 
     def scroll(self, x: int, y: int, direction: str = "down", amount: int | None = None) -> str:
-        """Scroll the mouse wheel using integer parameters x and y.
+        """Scroll the mouse wheel. Example x=240 y=180.
 
         left_click the pane first if it is not focused.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 59.
-            y: One JSON integer 0-{coord_max} for this field only, such as 900.
+            x: One JSON integer 0-{coord_max} for this field only, such as 240.
+            y: One JSON integer 0-{coord_max} for this field only, such as 180.
             direction: Wheel direction, up or down.
             amount: Wheel steps. Defaults to 3.
         """
@@ -602,9 +604,10 @@ class McpAwesun:
 
         raw = tomllib.loads(Path(path).read_text())
         cfg = raw["mcp_servers"]["awesun-mcp-server"]
-        coord_max = int(raw.get("ollama", {}).get("coord_max", 1000))
+        vlm = (raw.get("ollama") or {}).get("vlm") or {}
+        coord_max = int(vlm.get("coord_max") or (raw.get("ollama") or {}).get("coord_max") or 1000)
         if coord_max < 1:
-            raise ValueError("ollama.coord_max must be >= 1")
+            raise ValueError("ollama.vlm.coord_max must be >= 1")
         ready = threading.Event()
         errors: list[BaseException] = []
         holder: dict[str, Any] = {}
