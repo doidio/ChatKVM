@@ -111,7 +111,7 @@ def ollama_tool_defs(
     tools: Sequence[Callable[..., Any]],
     coord_max: int,
 ) -> list[dict[str, Any]]:
-    """Ollama 从函数生成 schema 时会丢掉 enum；坐标再标成 integer。"""
+    """Ollama 从函数生成 schema 时会丢掉 enum；坐标标成 [x, y] 整数数组。"""
     from ollama._utils import convert_function_to_tool
 
     defs: list[dict[str, Any]] = []
@@ -120,13 +120,16 @@ def ollama_tool_defs(
         props = (
             dumped.get("function", {}).get("parameters", {}).get("properties") or {}
         )
-        for key in ("x", "y", "x2", "y2"):
+        for key in ("xy", "to"):
             if key in props:
-                props[key]["type"] = "integer"
+                props[key]["type"] = "array"
+                props[key]["items"] = {"type": "integer"}
+                props[key]["minItems"] = 2
+                props[key]["maxItems"] = 2
                 desc = str(props[key].get("description") or "").strip()
                 if str(coord_max) not in desc:
                     props[key]["description"] = (
-                        f"{desc} Range 0-{coord_max}.".strip()
+                        f"{desc} Two integers 0-{coord_max}.".strip()
                     )
         if "direction" in props:
             props["direction"]["type"] = "string"
@@ -316,10 +319,23 @@ class McpAwesun:
             return float(value)
         except (TypeError, ValueError):
             raise ValueError(
-                f"{name} must be one JSON integer 0-{self.coord_max}, such as 240. "
-                f"Got {value!r}. Put only this field's number here; "
-                "the other axis is a separate field."
+                f"{name} must be a JSON integer 0-{self.coord_max}, such as 240. "
+                f"Got {value!r}."
             ) from None
+
+    def _xy_pixels(self, value: Any, *, name: str = "xy") -> tuple[int, int]:
+        raw = value
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = None
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            raise ValueError(
+                f"{name} must be [x, y] with two JSON integers 0-{self.coord_max}, "
+                f"such as [240, 180]. Got {value!r}."
+            )
+        return self._to_pixels(raw[0], raw[1], x_name=f"{name}[0]", y_name=f"{name}[1]")
 
     def _to_pixels(
         self,
@@ -347,9 +363,9 @@ class McpAwesun:
         my = round(y / height * scale)
         return min(max(mx, 0), scale), min(max(my, 0), scale)
 
-    def peek(self, x: Any, y: Any, *, size: int = 256) -> Path:
+    def peek(self, xy: Any, *, size: int = 256) -> Path:
         """从当前全屏图裁出指针目标附近，动作用来前调用。"""
-        x, y = self._to_pixels(x, y)
+        x, y = self._xy_pixels(xy)
         if self._screen is None:
             raise RuntimeError("尚未截图")
         left, top = x - size // 2, y - size // 2
@@ -382,6 +398,7 @@ class McpAwesun:
         return (
             self.left_click,
             self.right_click,
+            self.middle_click,
             self.left_double_click,
             self.left_drag,
             self.type_text,
@@ -392,11 +409,11 @@ class McpAwesun:
 
     @property
     def ollama_tools(self) -> list[dict[str, Any]]:
-        """Ollama 用的 JSON schema：坐标强制 integer，方向用 enum。"""
+        """Ollama 用的 JSON schema：坐标是 [x, y] 整数数组，方向用 enum。"""
         return ollama_tool_defs(self.agent_tools, self.coord_max)
 
-    def _pointer_click(self, x: Any, y: Any, *, button: str, clicks: int) -> str:
-        x, y = self._to_pixels(x, y)
+    def _pointer_click(self, xy: Any, *, button: str, clicks: int) -> str:
+        x, y = self._xy_pixels(xy)
         self.call_tool(
             "desktop_click_mouse",
             {
@@ -410,6 +427,8 @@ class McpAwesun:
         self._settle()
         if button == "right":
             action = "right_click"
+        elif button == "middle":
+            action = "middle_click"
         elif clicks == 2:
             action = "left_double_click"
         else:
@@ -419,76 +438,79 @@ class McpAwesun:
             "Inspect the new screenshot."
         )
 
-    def left_click(self, x: int, y: int) -> str:
-        """Left-click. Example x=240 y=180.
+    def left_click(self, xy: list[int]) -> str:
+        """Left-click at xy. Example {"xy": [240, 180]}.
 
         Use for buttons, links, tabs, list rows, menu items, and focusing a text field.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y: One JSON integer 0-{coord_max} for this field only, such as 180.
+            xy: Click point [x, y], two JSON integers 0-{coord_max}.
         """
-        return self._pointer_click(x, y, button="left", clicks=1)
+        return self._pointer_click(xy, button="left", clicks=1)
 
-    def right_click(self, x: int, y: int) -> str:
-        """Right-click. Example x=240 y=180.
+    def right_click(self, xy: list[int]) -> str:
+        """Right-click at xy. Example {"xy": [240, 180]}.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y: One JSON integer 0-{coord_max} for this field only, such as 180.
+            xy: Click point [x, y], two JSON integers 0-{coord_max}.
         """
-        return self._pointer_click(x, y, button="right", clicks=1)
+        return self._pointer_click(xy, button="right", clicks=1)
 
-    def left_double_click(self, x: int, y: int) -> str:
-        """Double left-click. Example x=240 y=180.
+    def middle_click(self, xy: list[int]) -> str:
+        """Middle-click at xy. Example {"xy": [240, 180]}.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y: One JSON integer 0-{coord_max} for this field only, such as 180.
+            xy: Click point [x, y], two JSON integers 0-{coord_max}.
         """
-        return self._pointer_click(x, y, button="left", clicks=2)
+        return self._pointer_click(xy, button="middle", clicks=1)
 
-    def left_drag(self, x: int, y: int, x2: int, y2: int) -> str:
-        """Drag with the left button. Example x=240 y=180 x2=520 y2=180.
+    def left_double_click(self, xy: list[int]) -> str:
+        """Double left-click at xy. Example {"xy": [240, 180]}.
+
+        Args:
+            xy: Click point [x, y], two JSON integers 0-{coord_max}.
+        """
+        return self._pointer_click(xy, button="left", clicks=2)
+
+    def left_drag(self, xy: list[int], to: list[int]) -> str:
+        """Press at xy and drag to the release point. Example {"xy": [240, 180], "to": [520, 180]}.
 
         Use for sliders, selections, and window edges.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y: One JSON integer 0-{coord_max} for this field only, such as 180.
-            x2: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y2: One JSON integer 0-{coord_max} for this field only, such as 180.
+            xy: Press point [x, y], two JSON integers 0-{coord_max}.
+            to: Release point [x, y], two JSON integers 0-{coord_max}.
         """
-        x1, y1 = self._to_pixels(x, y)
-        x2, y2 = self._to_pixels(x2, y2, x_name="x2", y_name="y2")
+        px1, py1 = self._xy_pixels(xy)
+        px2, py2 = self._xy_pixels(to, name="to")
         self.call_tool(
             "desktop_drag_mouse",
             {
                 "session_id": self.session,
                 "button": "left",
                 "paths": [
-                    self._path_point(x1, y1),
-                    self._path_point(x2, y2),
+                    self._path_point(px1, py1),
+                    self._path_point(px2, py2),
                 ],
             },
         )
         self._settle()
-        a = self._from_pixels(x1, y1)
-        b = self._from_pixels(x2, y2)
+        a = self._from_pixels(px1, py1)
+        b = self._from_pixels(px2, py2)
         return (
             f"left_drag ({a[0]}, {a[1]}) -> ({b[0]}, {b[1]}) on the 0-{self.coord_max} grid. "
             "Inspect the new screenshot."
         )
 
     def type_text(self, text: str) -> str:
-        """Type into the focused field. Example text=hello, world.
+        """Type into the focused field. Example {"text": "hello, world"}.
 
         left_click the field first if it is not focused. Characters append.
         Only ASCII letters, digits, space, and US-keyboard punctuation.
         Other characters are rejected; the tool result lists them.
 
         Args:
-            text: The string to type, such as hello, world.
+            text: Characters to type.
         """
         text = str(text)
         for keys in hid.chords_for_text(text):
@@ -498,7 +520,7 @@ class McpAwesun:
         return f"typed {len(text)} chars into the focused field. Inspect the new screenshot."
 
     def press_keys(self, keys: list[str]) -> str:
-        """Press a key or shortcut. Example keys=["ENTER"].
+        """Press a key or shortcut. Example {"keys": ["ENTER"]}.
 
         Use for Enter, Escape, Backspace, Tab, arrows, and chords.
         A single US-keyboard character is mapped to that key.
@@ -514,18 +536,17 @@ class McpAwesun:
         self._settle()
         return f"pressed {shown}. Inspect the new screenshot."
 
-    def scroll(self, x: int, y: int, direction: str = "down", amount: int | None = None) -> str:
-        """Scroll the mouse wheel. Example x=240 y=180.
+    def scroll(self, xy: list[int], direction: str = "down", amount: int | None = None) -> str:
+        """Scroll the wheel at xy. Example {"xy": [240, 180], "direction": "down"}.
 
         left_click the pane first if it is not focused.
 
         Args:
-            x: One JSON integer 0-{coord_max} for this field only, such as 240.
-            y: One JSON integer 0-{coord_max} for this field only, such as 180.
+            xy: Pointer [x, y], two JSON integers 0-{coord_max}.
             direction: Wheel direction, up or down.
             amount: Wheel steps. Defaults to 3.
         """
-        x, y = self._to_pixels(x, y)
+        x, y = self._xy_pixels(xy)
         amount = amount or 3
         self.call_tool(
             "desktop_scroll_mouse",
@@ -544,7 +565,7 @@ class McpAwesun:
         )
 
     def wait_for_change(self, timeout: int | None = None) -> str:
-        """Wait until the screen pixels change a lot compared with the last screenshot.
+        """Wait for a large screen change. Example {"timeout": 3000}.
 
         Use only after an action that should open a window or replace the page.
         Skip after typing or focusing a field. This does not read the image.
@@ -584,6 +605,7 @@ class McpAwesun:
         for name in (
             "left_click",
             "right_click",
+            "middle_click",
             "left_double_click",
             "left_drag",
             "scroll",

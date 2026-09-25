@@ -216,7 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-history/
 
 .venv/
 __pycache__/
@@ -229,3 +228,6 @@ uv.lock
 
 # Streamlit agent skills (environment-specific symlinks)
 .agents/skills/developing-with-streamlit
+
+history/
+project/

@@ -19,7 +19,7 @@ ROLES = {
 }
 
 st.set_page_config(
-    page_title="ChatKVM", layout="centered", initial_sidebar_state="expanded"
+    page_title="ChatKVM", layout="wide", initial_sidebar_state="expanded"
 )
 st.sidebar.title("ChatKVM")
 
@@ -38,7 +38,7 @@ vlm_coord_max = int(vlm.get("coord_max", 1000))
 SYSTEM = f"""
 你在远程操作一台电脑，你做过的操作都在上文记录保留。
 每轮只看最新全屏图。先读画面再行动；标题、菜单、对话框与目标不符就改策略。没有工具时用文字回答，不要假装操作。
-坐标是 0 到 {vlm_coord_max} 的相对值，原点左上。x 是一个 JSON 整数，y 是另一个 JSON 整数。不要把两个值写进同一个字段，不要用逗号、方括号或 y>。
+坐标是 0 到 {vlm_coord_max} 的相对值，原点左上。位置是长度为 2 的 JSON 整数数组，例如 [240, 180]。
 一次只做一步。调用工具时必须先写一句很短的话说明这一步做什么。单击、双击、右键、拖动、输入怎么用看工具说明。结果以最新截图为准。
 目标界面一旦出现就停手，完整抄下需要的信息。
 文本回答的语言与用户一致。
@@ -62,7 +62,7 @@ ollama_client = get_ollama_client(vlm_host)
 history = History.current()
 
 _PEEK = frozenset(
-    {"left_click", "right_click", "left_double_click", "left_drag", "scroll"}
+    {"left_click", "right_click", "middle_click", "left_double_click", "left_drag", "scroll"}
 )
 
 
@@ -191,6 +191,8 @@ def _note(item: dict) -> str:
 
 def show(item: dict) -> None:
     role = item.get("role") or ""
+    if role == "screen" and not st.session_state.get("show_screen", True):
+        return
     spec = ROLES.get(role) or {}
     note = _note(item)
     label = spec.get("label") or role
@@ -212,7 +214,7 @@ def show(item: dict) -> None:
             function = call["function"]
             st.caption(f":material/build: {function['name']} {function['arguments']}")
         if item.get("image"):
-            st.image(str(history.resolve(item["image"])))
+            st.image(str(history.resolve(item["image"])), width="content")
 
 
 # 聊天记录
@@ -271,7 +273,7 @@ tokens = tokens._replace(window=window)
 with st.bottom:
     with st.container(
         horizontal=True,
-        horizontal_alignment="center",
+        horizontal_alignment="left",
         vertical_alignment="center",
         gap="small",
     ):
@@ -293,6 +295,12 @@ with st.bottom:
         _show_steps(quota_box, 0)
         ctx_box = st.empty()
         _show_tokens(ctx_box, tokens)
+        st.checkbox(
+            "屏幕",
+            True,
+            key="show_screen",
+            help="显示聊天里的全屏截图",
+        )
     prompt = st.chat_input("随心输入")
 
 if prompt:
@@ -364,10 +372,10 @@ if prompt:
             started = time.monotonic()
             peek_image = None
             if name in _PEEK:
-                px, py = arguments.get("x"), arguments.get("y")
-                if px is not None:
+                xy = arguments.get("xy")
+                if xy is not None:
                     try:
-                        peek = mcp_awesun.peek(px, py)
+                        peek = mcp_awesun.peek(xy)
                         peek_image = history.save_image("tool", peek)
                         peek.unlink(missing_ok=True)
                     except Exception:
