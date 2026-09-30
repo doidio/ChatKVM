@@ -1,19 +1,28 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "chatkvm"
 version = "0.1.0"
 description = ""
+readme = "README.md"
+authors = [
+    { name = "sjtu_6547", email = "88172828@qq.com" }
+]
 requires-python = ">=3.13"
 dependencies = [
     "mcp>=2.2.0",
-    "ollama>=0.6.2",
-    "pillow>=12.0.0",
-    "streamlit>=1.63.0",
-    "watchdog>=6.0.0",
+    "pydantic-ai-slim[openai]>=2.0.0",
+    "streamlit>=1.64.0",
+    "tomlkit>=0.15.1",
 ]
 
 [project.scripts]
-chatkvm = "chatkvm.__main__:main"
+chatkvm = "chatkvm:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.format]
+quote-style = "single"
