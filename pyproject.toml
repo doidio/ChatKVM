@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "mcp>=2.2.0",
+    "pillow>=12.0.0",
     "pydantic-ai-slim[openai]>=2.0.0",
     "streamlit>=1.64.0",
     "tomlkit>=0.15.1",
@@ -16,6 +17,9 @@ dependencies = [
 
 [project.scripts]
 chatkvm = "chatkvm:main"
+
+[project.optional-dependencies]
+voice = ["funasr", "modelscope", "torch", "torchaudio", "soundfile", "transformers>=4.51,<5"]
 
 [build-system]
 requires = ["hatchling"]

@@ -20,6 +20,7 @@ class Device:
     id: str
     url: str
     description: str
+    text_input: str
 
 
 @dataclass(frozen=True)
@@ -42,8 +43,19 @@ class Frame:
 
 class Devices:
     def __init__(self, config: dict[str, dict[str, str]]) -> None:
-        self._devices = {device_id: Device(device_id, values['url'], values.get('description', '')) for device_id, values in config.items()}
+        self._devices = {}
+        for device_id, values in config.items():
+            method = values.get('text_input', 'ascii')
+            if method not in ('ascii', 'windows_gbk'):
+                raise ValueError(f'{device_id} 的 text_input 不支持: {method}')
+            self._devices[device_id] = Device(device_id, values['url'], values.get('description', ''), method)
         self._read_timeout_seconds = 30
+
+    def text_input_method(self, device_id: str) -> str:
+        try:
+            return self._devices[device_id].text_input
+        except KeyError:
+            raise DeviceError(f'未知设备 {device_id!r}；请先调用 list_devices。') from None
 
     def list(self) -> list[dict[str, str]]:
         """List configured devices; this does not imply that they are online."""
@@ -52,14 +64,14 @@ class Devices:
     def ids(self) -> list[str]:
         return list(self._devices)
 
-    async def call(self, device_id: str, tool_name: str, **arguments: Any) -> CallToolResult:
+    async def call(self, device_id: str, tool_name: str, *, read_timeout_seconds: float | None = None, **arguments: Any) -> CallToolResult:
         device = self._devices.get(device_id)
         if device is None:
             raise DeviceError(f'未知设备 {device_id!r}；请先调用 list_devices。')
 
         try:
             async with Client(device.url) as client:
-                result = await client.call_tool(tool_name, arguments or None, read_timeout_seconds=self._read_timeout_seconds)
+                result = await client.call_tool(tool_name, arguments or None, read_timeout_seconds=read_timeout_seconds or self._read_timeout_seconds)
         except Exception as exc:
             raise DeviceError(f'{device_id} 的 {tool_name} 请求失败：{exc}') from exc
 

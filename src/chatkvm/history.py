@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -14,7 +14,7 @@ from chatkvm.agent import ToolEvent, compact_history
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -42,7 +42,11 @@ def _timeline(messages: list[ModelMessage], events: list[dict]) -> list[dict]:
                 index = next((i for i, event in enumerate(remaining) if event.get('tool_call_id') == part.tool_call_id and part.tool_call_id), None)
                 if index is None:
                     index = next(
-                        (i for i, event in enumerate(remaining) if event['name'] == part.tool_name and event['device_id'] == arguments.get('device_id')),
+                        (
+                            i
+                            for i, event in enumerate(remaining)
+                            if event['name'] == part.tool_name and event['device_id'] == arguments.get('device_id')
+                        ),
                         None,
                     )
                 if index is not None:
@@ -130,6 +134,7 @@ class History:
         input_tokens: int = 0,
         output_tokens: int = 0,
         context_window: int | None = None,
+        include_history: bool = True,
         error: bool = False,
     ) -> dict:
         directory = self._directory(conversation_id)
@@ -146,6 +151,9 @@ class History:
             }
             if event.tool_call_id:
                 record['tool_call_id'] = event.tool_call_id
+            if event.tool_count is not None and event.tool_limit is not None:
+                record['tool_count'] = event.tool_count
+                record['tool_limit'] = event.tool_limit
             if event.frame:
                 screen_dir = directory / 'screens'
                 screen_dir.mkdir(exist_ok=True)
@@ -163,6 +171,7 @@ class History:
             'output_tokens': output_tokens,
             'error': error,
             'context_window': context_window,
+            'include_history': include_history,
         }
         if new_messages_json is not None:
             turn['timeline'] = _timeline(ModelMessagesTypeAdapter.validate_json(new_messages_json), event_records)
@@ -173,7 +182,7 @@ class History:
         with (directory / 'turns.jsonl').open('a', encoding='utf-8') as file:
             file.write(json.dumps(turn, ensure_ascii=False) + '\n')
         if messages is not None:
-            _atomic_write(directory / 'context.json', ModelMessagesTypeAdapter.dump_json(compact_history(messages)))
+            _atomic_write(directory / 'context.json', ModelMessagesTypeAdapter.dump_json(compact_history(messages, keep_images=0)))
         if metadata['title'] == '新对话':
             metadata['title'] = prompt.replace('\n', ' ').strip()[:40] or '新对话'
         metadata['updated_at'] = _now()

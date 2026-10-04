@@ -2,17 +2,19 @@ import asyncio
 import base64
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
 from mcp.types import CallToolResult, ImageContent, TextContent
+from PIL import Image
 from pydantic_ai import BinaryContent, ModelResponse, TextPart, ThinkingPart, ToolCallPart
-from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.function import DeltaThinkingPart, DeltaToolCall, FunctionModel
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
-from chatkvm.agent import ChatDeps, _screen_point_error, build_agent, chat
+from chatkvm.agent import ChatDeps, _display_size, _present_frame, _screen_point_error, build_agent, chat
 from chatkvm.devices import DeviceError, Devices, Frame
 from chatkvm.history import History
 
@@ -67,9 +69,14 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
 class FakeDevices:
     def __init__(self):
         self.calls = []
+        self.text_input = 'ascii'
 
     def list(self):
         return [{'device_id': 'pc_a', 'description': '测试电脑'}]
+
+    def text_input_method(self, device_id: str):
+        assert device_id == 'pc_a'
+        return self.text_input
 
     async def capture(self, device_id: str):
         return Frame(device_id, PNG, 'image/png', '截图尺寸 1x1 像素')
@@ -93,6 +100,7 @@ class AgentTests(unittest.TestCase):
     def test_thinking_setting_and_intermediate_response_timeline(self):
         agent = self.make_agent()
         self.assertEqual(agent.model_settings['openai_reasoning_effort'], 'none')
+        self.assertNotIn('temperature', agent.model_settings)
         model = OllamaModel('qwen3.8:27b', provider=OllamaProvider(base_url='http://127.0.0.1:11435/v1'))
         self.assertEqual(build_agent(model, allow_control=True, thinking=True).model_settings['openai_reasoning_effort'], 'medium')
         deps = self.make_deps(FakeDevices())
@@ -122,6 +130,32 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(timeline[1]['text'], '我先查看设备。')
             self.assertEqual(timeline[2]['event']['name'], 'list_devices')
 
+    def test_thinking_streams_before_final_response(self):
+        agent = self.make_agent()
+        deps = self.make_deps(FakeDevices())
+        live = []
+        deps.on_thinking = lambda chunk: live.append(('thinking', chunk))
+        deps.on_model_response = lambda response: live.append(('response', response))
+        calls = 0
+
+        async def stream(_messages, _info):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield {0: DeltaThinkingPart(content='先检查')}
+                yield {0: DeltaThinkingPart(content='设备。')}
+                yield {1: DeltaToolCall(name='list_devices', json_args='{}')}
+            else:
+                yield {0: DeltaThinkingPart(content='设备已找到。')}
+                yield '已完成。'
+
+        with agent.override(model=FunctionModel(stream_function=stream)):
+            result = self.run_chat(agent, '测试思考', deps)
+        self.assertEqual(result.output, '已完成。')
+        self.assertEqual([event.name for event in deps.events], ['list_devices'])
+        self.assertEqual(''.join(chunk for kind, chunk in live if kind == 'thinking' and chunk), '先检查设备。设备已找到。')
+        self.assertLess(next(i for i, item in enumerate(live) if item[0] == 'thinking'), next(i for i, item in enumerate(live) if item[0] == 'response'))
+
     def test_tool_limit_counts_read_only_calls_too(self):
         agent = self.make_agent()
         devices = FakeDevices()
@@ -144,8 +178,30 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.output, '上限已达到。')
         self.assertEqual(deps.tool_count, 2)
         self.assertEqual([event.name for event in deps.events], ['list_devices', 'capture_screen', 'key_press'])
+        self.assertEqual([(event.tool_count, event.tool_limit) for event in deps.events], [(1, 2), (2, 2), (2, 2)])
         self.assertIn('上限', deps.events[-1].result)
         self.assertEqual(devices.calls, [])
+
+    def test_tool_budget_updates_each_request_and_resets_next_turn(self):
+        agent = self.make_agent()
+        history = []
+        for _ in range(2):
+            deps = self.make_deps(FakeDevices(), tool_limit=100)
+            calls = 0
+
+            def model(_messages, info):
+                nonlocal calls
+                self.assertIn(f'本轮工具调用上限 100 次，已用 {calls} 次，剩余 {100 - calls} 次。', info.instructions)
+                calls += 1
+                if calls <= 2:
+                    return ModelResponse(parts=[ToolCallPart('list_devices', {})])
+                return ModelResponse(parts=[TextPart('完成。')])
+
+            with agent.override(model=FunctionModel(model)):
+                result = asyncio.run(chat(agent, '查看设备', history, deps))
+            history = result.messages
+            self.assertEqual(deps.tool_count, 2)
+            self.assertEqual([(event.tool_count, event.tool_limit) for event in deps.events], [(1, 100), (2, 100)])
 
     def test_disabling_control_hides_hid_tools(self):
         agent = self.make_agent(allow_control=False)
@@ -199,10 +255,23 @@ class AgentTests(unittest.TestCase):
                     for part in message.parts
                     for item in (part.content if isinstance(getattr(part, 'content', None), list) else [])
                 ),
-                1,
+                0,
             )
+            observed = []
 
-    def test_each_model_request_keeps_latest_image_and_emits_all_events(self):
+            def next_turn(messages, _info):
+                observed.extend(
+                    item for message in messages for part in message.parts
+                    for item in (part.content if isinstance(getattr(part, 'content', None), list) else [])
+                    if isinstance(item, BinaryContent)
+                )
+                return ModelResponse(parts=[TextPart('下一轮。')])
+
+            with agent.override(model=FunctionModel(next_turn)):
+                asyncio.run(chat(agent, '继续', context, self.make_deps(FakeDevices())))
+            self.assertEqual(observed, [])
+
+    def test_each_model_request_keeps_two_recent_images_and_emits_all_events(self):
         agent = self.make_agent()
         deps = self.make_deps(FakeDevices())
         events = []
@@ -222,19 +291,19 @@ class AgentTests(unittest.TestCase):
                 for item in (part.content if isinstance(getattr(part, 'content', None), list) else [])
                 if isinstance(item, BinaryContent)
             ]
-            self.assertEqual(len(images), 0 if calls == 1 else 1)
+            self.assertEqual(len(images), min(2, calls - 1))
             if images:
-                self.assertEqual(images[0].data, PNG + bytes([calls - 1]))
+                self.assertEqual([image.data[-1] for image in images], list(range(max(1, calls - 2), calls)))
             self.assertEqual(len(events), calls - 1)
-            if calls <= 3:
+            if calls <= 7:
                 return ModelResponse(parts=[ToolCallPart('capture_screen', {'device_id': 'pc_a'})])
             return ModelResponse(parts=[TextPart('完成。')])
 
         with patch.object(deps.devices, 'capture', capture), agent.override(model=FunctionModel(model)):
-            result = self.run_chat(agent, '依次查看三次画面', deps)
-        self.assertEqual(len(events), 3)
+            result = self.run_chat(agent, '依次查看画面', deps)
+        self.assertEqual(len(events), 7)
         self.assertEqual(events, deps.events)
-        self.assertEqual(result.new_messages_json.count(b'iVBOR'), 3)
+        self.assertEqual(result.new_messages_json.count(b'iVBOR'), 7)
 
     def test_pixel_coordinates_require_current_frame_and_stay_unconverted(self):
         devices = FakeDevices()
@@ -245,6 +314,63 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(_screen_point_error(deps, 'pc_a', 0, 0))
         self.assertIn('超出', _screen_point_error(deps, 'pc_a', 1, 0))
         self.assertIn('超出', _screen_point_error(deps, 'pc_a', 0, 1))
+
+    def test_full_screen_presentation_preserves_capture_coordinate_bounds(self):
+        for source_size in ((1920, 1080), (2560, 1440)):
+            with self.subTest(source_size=source_size):
+                output = BytesIO()
+                Image.new('RGB', source_size, 'white').save(output, format='PNG')
+                frame = Frame('pc_a', output.getvalue(), 'image/png', '截图')
+                self.assertEqual(_display_size(frame.size), (3840, 2160))
+                with Image.open(BytesIO(_present_frame(frame).data)) as presented:
+                    self.assertEqual(presented.size, (3840, 2160))
+                deps = self.make_deps(FakeDevices(), frames={'pc_a': frame})
+                self.assertIsNone(_screen_point_error(deps, 'pc_a', source_size[0] - 1, source_size[1] - 1))
+                self.assertIn('超出', _screen_point_error(deps, 'pc_a', source_size[0], source_size[1]))
+
+    def test_mouse_tool_passes_capture_coordinates_without_rescaling(self):
+        output = BytesIO()
+        Image.new('RGB', (2560, 1440), 'white').save(output, format='PNG')
+        devices = FakeDevices()
+        deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', output.getvalue(), 'image/png', '截图')})
+        agent = self.make_agent()
+        calls = 0
+
+        def model(_messages, _info):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('mouse_click', {'device_id': 'pc_a', 'x': 1280, 'y': 720})])
+            return ModelResponse(parts=[TextPart('已点击。')])
+
+        with agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '点击中心', deps)
+        self.assertEqual(devices.calls[0], ('pc_a', 'mouse_click', {'x': 1280, 'y': 720, 'button': 'left', 'count': 1}))
+
+    def test_name_field_and_query_button_coordinates_do_not_halve(self):
+        output = BytesIO()
+        Image.new('RGB', (1920, 1080), 'white').save(output, format='PNG')
+        frame = Frame('pc_a', output.getvalue(), 'image/png', '截图')
+        devices = FakeDevices()
+        deps = self.make_deps(devices, frames={'pc_a': frame})
+        agent = self.make_agent()
+        calls = 0
+
+        def model(_messages, info):
+            nonlocal calls
+            calls += 1
+            click = next(tool for tool in info.function_tools if tool.name == 'mouse_click')
+            self.assertIn('采集原图像素坐标', click.description)
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('mouse_click', {'device_id': 'pc_a', 'x': 650, 'y': 169})])
+            if calls == 2:
+                deps.frames['pc_a'] = frame
+                return ModelResponse(parts=[ToolCallPart('mouse_click', {'device_id': 'pc_a', 'x': 1664, 'y': 169})])
+            return ModelResponse(parts=[TextPart('完成。')])
+
+        with agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '操作输入框和查询按钮', deps)
+        self.assertEqual([(call[2]['x'], call[2]['y']) for call in devices.calls], [(650, 169), (1664, 169)])
 
     def test_mouse_tool_rejects_out_of_bounds_without_calling_device(self):
         agent = self.make_agent()
@@ -283,6 +409,51 @@ class AgentTests(unittest.TestCase):
             self.run_chat(agent, '移动鼠标', deps)
         self.assertEqual(devices.calls, [('pc_a', 'mouse_move', {'x': 0, 'y': 0})])
 
+    def test_double_click_is_one_device_call(self):
+        agent = self.make_agent()
+        devices = FakeDevices()
+        deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '截图')})
+        calls = 0
+
+        def model(_messages, info):
+            nonlocal calls
+            calls += 1
+            tool = next(tool for tool in info.function_tools if tool.name == 'mouse_click')
+            self.assertEqual(tool.parameters_json_schema['properties']['count']['enum'], [1, 2])
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('mouse_click', {'device_id': 'pc_a', 'x': 0, 'y': 0, 'count': 2})])
+            return ModelResponse(parts=[TextPart('已双击。')])
+
+        with agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '双击', deps)
+        self.assertEqual(devices.calls, [('pc_a', 'mouse_click', {'x': 0, 'y': 0, 'button': 'left', 'count': 2})])
+        self.assertEqual(deps.tool_count, 1)
+
+    def test_drag_is_one_device_call_and_validates_both_endpoints(self):
+        agent = self.make_agent()
+        devices = FakeDevices()
+        deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '截图尺寸 1x1 像素')})
+        calls = 0
+
+        def model(_messages, info):
+            nonlocal calls
+            calls += 1
+            tool = next(tool for tool in info.function_tools if tool.name == 'mouse_drag')
+            self.assertEqual(tool.parameters_json_schema['properties']['duration_seconds']['default'], 0.6)
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('mouse_drag', {'device_id': 'pc_a', 'start_x': 0, 'start_y': 0, 'end_x': 1, 'end_y': 0})])
+            if calls == 2:
+                return ModelResponse(parts=[ToolCallPart('mouse_drag', {'device_id': 'pc_a', 'start_x': 0, 'start_y': 0, 'end_x': 0, 'end_y': 0})])
+            return ModelResponse(parts=[TextPart('完成。')])
+
+        with agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '拖拽', deps)
+        self.assertIn('超出', deps.events[0].result)
+        self.assertEqual(devices.calls, [('pc_a', 'mouse_drag', {
+            'start_x': 0, 'start_y': 0, 'end_x': 0, 'end_y': 0, 'button': 'left', 'duration_seconds': 0.6,
+        })])
+        self.assertEqual(deps.tool_count, 2)
+
     def test_key_press_requires_a_capture_in_the_current_turn(self):
         agent = self.make_agent()
         devices = FakeDevices()
@@ -312,12 +483,15 @@ class AgentTests(unittest.TestCase):
         def model(messages, info):
             nonlocal calls
             calls += 1
+            self.assertIn('每次键鼠操作前，依据当前画面确认目标状态、焦点等操作前提', info.instructions)
             assert [tool.name for tool in info.function_tools] == [
                 'list_devices',
                 'capture_screen',
                 'mouse_move',
                 'mouse_click',
+                'mouse_drag',
                 'key_press',
+                'type_text',
             ]
             if calls == 1:
                 return ModelResponse(parts=[ToolCallPart('list_devices', {})])
@@ -327,6 +501,89 @@ class AgentTests(unittest.TestCase):
         with agent.override(model=FunctionModel(model)):
             result = self.run_chat(agent, '有哪些设备？', deps)
         self.assertEqual(result.output, '共配置了 1 台设备：pc_a。')
+
+    def test_text_tool_uses_device_input_method(self):
+        agent = self.make_agent()
+        devices = FakeDevices()
+        devices.text_input = 'windows_gbk'
+        deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '截图')})
+        calls = 0
+
+        def model(_messages, _info):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('type_text', {'device_id': 'pc_a', 'text': '中文 ABC'})])
+            return ModelResponse(parts=[TextPart('已发送。')])
+
+        with agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '输入文本', deps)
+        self.assertEqual(len(devices.calls), 1)
+        device_id, tool_name, arguments = devices.calls[0]
+        self.assertEqual((device_id, tool_name), ('pc_a', 'type_text'))
+        self.assertEqual(arguments['text'], '中文 ABC')
+        self.assertEqual(arguments['method'], 'windows_gbk')
+        self.assertGreaterEqual(arguments['read_timeout_seconds'], 30)
+        self.assertIn('不代表文字已进入', deps.events[0].result)
+
+    def test_state_changing_tools_return_fresh_frame_without_extra_tool_call(self):
+        cases = [
+            ('mouse_click', {'device_id': 'pc_a', 'x': 0, 'y': 0}),
+            ('mouse_drag', {'device_id': 'pc_a', 'start_x': 0, 'start_y': 0, 'end_x': 0, 'end_y': 0}),
+            ('key_press', {'device_id': 'pc_a', 'key': 'enter'}),
+            ('type_text', {'device_id': 'pc_a', 'text': 'A'}),
+        ]
+        for name, arguments in cases:
+            with self.subTest(tool=name):
+                agent = self.make_agent()
+                devices = FakeDevices()
+                deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '旧画面')})
+                calls = 0
+
+                def model(messages, _info, tool_name=name, tool_arguments=arguments):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return ModelResponse(parts=[ToolCallPart(tool_name, tool_arguments)])
+                    images = [
+                        item for message in messages for part in message.parts
+                        for item in (part.content if isinstance(getattr(part, 'content', None), list) else [])
+                        if isinstance(item, BinaryContent)
+                    ]
+                    self.assertEqual([item.data for item in images], [PNG])
+                    self.assertFalse(any(
+                        '显示图' in part.content
+                        for message in messages for part in message.parts
+                        if isinstance(getattr(part, 'content', None), str)
+                    ))
+                    return ModelResponse(parts=[TextPart('已核对。')])
+
+                with patch.object(devices, 'capture', wraps=devices.capture) as capture, agent.override(model=FunctionModel(model)):
+                    self.run_chat(agent, '测试操作后画面', deps)
+                self.assertEqual(capture.call_count, 1)
+                self.assertEqual(deps.tool_count, 1)
+                self.assertEqual(deps.events[0].frame, deps.frames['pc_a'])
+                self.assertEqual(devices.calls[0][1], name)
+
+    def test_action_capture_failure_does_not_claim_result_verified(self):
+        agent = self.make_agent()
+        devices = FakeDevices()
+        deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '旧画面')})
+        calls = 0
+
+        def model(_messages, _info):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ModelResponse(parts=[ToolCallPart('mouse_click', {'device_id': 'pc_a', 'x': 0, 'y': 0})])
+            return ModelResponse(parts=[TextPart('结果尚未核实。')])
+
+        with patch.object(devices, 'capture', side_effect=DeviceError('截图离线')), agent.override(model=FunctionModel(model)):
+            self.run_chat(agent, '测试截图失败', deps)
+        self.assertEqual(len(devices.calls), 1)
+        self.assertEqual(deps.frames, {})
+        self.assertIn('结果尚未核实', deps.events[0].result)
+        self.assertIsNone(deps.events[0].frame)
 
     def test_delayed_capture_waits_before_fetching_frame(self):
         agent = self.make_agent()
