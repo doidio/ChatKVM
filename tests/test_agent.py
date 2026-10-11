@@ -15,7 +15,7 @@ from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 from chatkvm.agent import ChatDeps, _display_size, _present_frame, _screen_point_error, build_agent, chat
-from chatkvm.devices import DeviceError, Devices, Frame
+from chatkvm.devices import CAPTURE_TIMEOUT_SECONDS, DeviceError, Devices, Frame
 from chatkvm.history import History
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII=')
@@ -36,7 +36,7 @@ class FakeClient:
 
     async def call_tool(self, name: str, _arguments, read_timeout_seconds: int):
         assert name == 'latest_frame'
-        assert read_timeout_seconds == 30
+        assert read_timeout_seconds == CAPTURE_TIMEOUT_SECONDS
         return CallToolResult(
             content=[
                 TextContent(type='text', text='截图尺寸 1x1 像素'),
@@ -65,18 +65,29 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
             await devices.capture('not_configured')
         self.assertEqual(FakeClient.urls, [])
 
+    async def test_capture_timeout_reports_device_may_be_offline(self):
+        devices = Devices({'pc_a': {'url': 'http://a/mcp', 'description': 'A'}})
+
+        async def slow_call(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        with patch.object(devices, 'call', side_effect=slow_call), patch('chatkvm.devices.CAPTURE_TIMEOUT_SECONDS', 0.001):
+            with self.assertRaisesRegex(DeviceError, '请求失败，设备可能离线'):
+                await devices.capture('pc_a')
+
+    async def test_capture_connection_failure_reports_device_may_be_offline(self):
+        devices = Devices({'pc_a': {'url': 'http://a/mcp', 'description': 'A'}})
+        with patch.object(devices, 'call', side_effect=DeviceError('连接被拒绝')):
+            with self.assertRaisesRegex(DeviceError, '请求失败，设备可能离线'):
+                await devices.capture('pc_a')
+
 
 class FakeDevices:
     def __init__(self):
         self.calls = []
-        self.text_input = 'ascii'
 
     def list(self):
         return [{'device_id': 'pc_a', 'description': '测试电脑'}]
-
-    def text_input_method(self, device_id: str):
-        assert device_id == 'pc_a'
-        return self.text_input
 
     async def capture(self, device_id: str):
         return Frame(device_id, PNG, 'image/png', '截图尺寸 1x1 像素')
@@ -502,10 +513,9 @@ class AgentTests(unittest.TestCase):
             result = self.run_chat(agent, '有哪些设备？', deps)
         self.assertEqual(result.output, '共配置了 1 台设备：pc_a。')
 
-    def test_text_tool_uses_device_input_method(self):
+    def test_text_tool_leaves_input_method_to_device(self):
         agent = self.make_agent()
         devices = FakeDevices()
-        devices.text_input = 'windows_gbk'
         deps = self.make_deps(devices, frames={'pc_a': Frame('pc_a', PNG, 'image/png', '截图')})
         calls = 0
 
@@ -522,7 +532,7 @@ class AgentTests(unittest.TestCase):
         device_id, tool_name, arguments = devices.calls[0]
         self.assertEqual((device_id, tool_name), ('pc_a', 'type_text'))
         self.assertEqual(arguments['text'], '中文 ABC')
-        self.assertEqual(arguments['method'], 'windows_gbk')
+        self.assertNotIn('method', arguments)
         self.assertGreaterEqual(arguments['read_timeout_seconds'], 30)
         self.assertIn('不代表文字已进入', deps.events[0].result)
 

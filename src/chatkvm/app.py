@@ -2,9 +2,12 @@
 
 import argparse
 import asyncio
+import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import streamlit as st
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
@@ -13,7 +16,6 @@ from chatkvm.agent import ChatDeps, ToolEvent, build_agent, chat, resolve_model
 from chatkvm.config import read_config
 from chatkvm.devices import DeviceError, Devices
 from chatkvm.history import History
-from chatkvm.model_info import ollama_context_limits
 from chatkvm.speech import SpeechRecognizer
 
 VIDEO_SIZES = ('1920x1080', '2560x1440')
@@ -33,6 +35,46 @@ TOOL_LABELS = {
     'key_press': '按键',
     'type_text': '输入文本',
 }
+
+
+def _ollama_api(base_url: str, endpoint: str, payload: dict | None = None) -> dict:
+    root = base_url.rstrip('/').removesuffix('/v1')
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = Request(f'{root}/api/{endpoint}', data=data, headers={'Content-Type': 'application/json'})
+    with urlopen(request, timeout=3) as response:
+        return json.load(response)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def ollama_context_limits(model: dict) -> tuple[int | None, int | None]:
+    """Return the active Ollama window and the model metadata limit for the UI."""
+    if model['provider'] != 'ollama':
+        return None, None
+
+    runtime = maximum = None
+    try:
+        running = _ollama_api(model['base_url'], 'ps')
+        match = next((item for item in running.get('models', []) if model['name'] in (item.get('name'), item.get('model'))), None)
+        if match:
+            runtime = match.get('context_length')
+    except (OSError, URLError, ValueError, KeyError):
+        pass
+
+    try:
+        details = _ollama_api(model['base_url'], 'show', {'model': model['name']})
+        maximum = details.get('model_info', {}).get(f"{details['details']['family']}.context_length")
+    except (OSError, URLError, ValueError, KeyError):
+        pass
+    return runtime, maximum
+
+
+def turn_caption(turn: dict, runtime_context: int | None, model_context_max: int | None) -> str:
+    caption = f'用时 {turn["duration_ms"] / 1000:.1f} 秒'
+    input_tokens = turn.get('input_tokens', 0)
+    context_window = turn.get('context_window') or runtime_context or model_context_max
+    if input_tokens and context_window:
+        caption += f'  上下文 {input_tokens / context_window:.1%}  {input_tokens:,} / {context_window:,} tokens'
+    return caption
 
 
 @st.cache_resource(max_entries=1, show_spinner=False)
@@ -176,7 +218,7 @@ def select_conversation() -> None:
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-c', '--config', default='config.toml')
+parser.add_argument('-c', '--config', default='chatkvm.toml')
 args = parser.parse_args()
 
 st.set_page_config(page_title='ChatKVM', layout='wide')
@@ -278,16 +320,16 @@ for turn_number, turn in enumerate(turns, start=1):
             st.error(turn['response'])
         else:
             st.markdown(turn['response'])
-        st.caption(f'用时 {turn["duration_ms"] / 1000:.1f} 秒')
+        st.caption(turn_caption(turn, runtime_context, model_context_max))
 
 with st.bottom:
-    speech_config = config.get('speech')
+    voice_config = config.get('voice')
     speech_future = None
     speech_error = None
-    if speech_config:
+    if voice_config:
         try:
-            model_path = str((config_path.parent / speech_config['model']).resolve())
-            vad_path = str((config_path.parent / speech_config['vad_model']).resolve())
+            model_path = str((config_path.parent / voice_config['model']).resolve())
+            vad_path = str((config_path.parent / voice_config['vad_model']).resolve())
             speech_future = speech_recognizer(model_path, vad_path)
         except (KeyError, TypeError, ValueError) as exc:
             speech_error = exc
@@ -297,13 +339,13 @@ with st.bottom:
     submission = st.chat_input(
         '发送消息',
         key=input_key,
-        accept_audio=bool(speech_config),
+        accept_audio=bool(voice_config),
         max_upload_size=4,
         submit_mode='disable',
         on_submit=handle_submission,
         args=(input_key, speech_future, speech_error),
     )
-    prompt = submission.text if speech_config and submission else submission
+    prompt = submission.text if voice_config and submission else submission
     with st.container(horizontal=True, horizontal_alignment='center', vertical_alignment='center', gap='small', key='chat_controls'):
         allow_control = st.toggle('操控', key='allow_control', width='content', disabled=busy)
         st.caption('上限', width='content')
@@ -311,15 +353,7 @@ with st.bottom:
             '操控上限', sorted(TOOL_LIMITS, reverse=True), key='tool_limit', width=90, label_visibility='collapsed', disabled=busy
         )
         thinking = st.toggle('思考', key='thinking', width='content', disabled=busy)
-        include_history = st.toggle('前文', key='include_history', width='content', disabled=busy)
-        last_success = next((turn for turn in reversed(turns) if not turn['error']), None)
-        usage_turn = last_success if last_success and last_success.get('include_history', True) == include_history else None
-        input_tokens = usage_turn['input_tokens'] if usage_turn else 0
-        context_window = (usage_turn.get('context_window') if usage_turn else None) or runtime_context
-        context_window = context_window or model_context_max
-        usage = f'{input_tokens / context_window:.1%}' if usage_turn and context_window else ('0.0%' if not turns else '—')
-        usage_help = f'{input_tokens:,} / {context_window:,} tokens' if usage_turn and context_window else None
-        st.caption(usage, help=usage_help, width='content')
+        include_history = st.toggle('上文', key='include_history', width='content', disabled=busy)
 
 if busy and not prompt:
     st.session_state['agent_busy'] = False

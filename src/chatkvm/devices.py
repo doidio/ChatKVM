@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import struct
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from typing import Any
 
 from mcp import Client
 from mcp.types import CallToolResult, ImageContent, TextContent
+
+CAPTURE_TIMEOUT_SECONDS = 12
 
 
 class DeviceError(Exception):
@@ -20,7 +23,6 @@ class Device:
     id: str
     url: str
     description: str
-    text_input: str
 
 
 @dataclass(frozen=True)
@@ -45,17 +47,8 @@ class Devices:
     def __init__(self, config: dict[str, dict[str, str]]) -> None:
         self._devices = {}
         for device_id, values in config.items():
-            method = values.get('text_input', 'ascii')
-            if method not in ('ascii', 'windows_gbk'):
-                raise ValueError(f'{device_id} 的 text_input 不支持: {method}')
-            self._devices[device_id] = Device(device_id, values['url'], values.get('description', ''), method)
+            self._devices[device_id] = Device(device_id, values['url'], values.get('description', ''))
         self._read_timeout_seconds = 30
-
-    def text_input_method(self, device_id: str) -> str:
-        try:
-            return self._devices[device_id].text_input
-        except KeyError:
-            raise DeviceError(f'未知设备 {device_id!r}；请先调用 list_devices。') from None
 
     def list(self) -> list[dict[str, str]]:
         """List configured devices; this does not imply that they are online."""
@@ -81,7 +74,11 @@ class Devices:
         return result
 
     async def capture(self, device_id: str) -> Frame:
-        result = await self.call(device_id, 'latest_frame')
+        try:
+            async with asyncio.timeout(CAPTURE_TIMEOUT_SECONDS):
+                result = await self.call(device_id, 'latest_frame', read_timeout_seconds=CAPTURE_TIMEOUT_SECONDS)
+        except (DeviceError, TimeoutError) as exc:
+            raise DeviceError(f'{device_id} 查看画面请求失败，设备可能离线。') from exc
         image = next((part for part in result.content if isinstance(part, ImageContent)), None)
         if image is None:
             raise DeviceError(f'{device_id} 的 latest_frame 未返回图像。')

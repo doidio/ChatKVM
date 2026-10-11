@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import io
+import json
 from types import SimpleNamespace
 from pathlib import Path
 from threading import Event
@@ -15,6 +16,19 @@ from chatkvm.history import History
 from chatkvm.agent import ToolEvent
 from chatkvm.devices import Frame
 from test_agent import PNG
+
+
+def ollama_urlopen(runtime_context: int | None = 8192, maximum_context: int = 262144):
+    def open_url(request, timeout=3):
+        del timeout
+        if request.full_url.endswith('/api/ps'):
+            models = [] if runtime_context is None else [{'name': 'test', 'context_length': runtime_context}]
+            payload = {'models': models}
+        else:
+            payload = {'details': {'family': 'test'}, 'model_info': {'test.context_length': maximum_context}}
+        return io.BytesIO(json.dumps(payload).encode())
+
+    return open_url
 
 
 class AppTests(unittest.TestCase):
@@ -46,7 +60,7 @@ class AppTests(unittest.TestCase):
                     patch('sys.argv', ['app.py']),
                     patch('chatkvm.config.read_config', return_value=config),
                     patch('chatkvm.history.History', return_value=history),
-                    patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                    patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
                     patch('chatkvm.agent.chat', side_effect=run_agent),
                     patch('streamlit.radio', wraps=st.radio) as radio,
                     patch('streamlit.button', wraps=st.button) as buttons,
@@ -83,7 +97,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py'))
                 app.session_state['agent_busy'] = True
@@ -104,7 +118,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py'))
                 app.session_state['active_chat'] = first
@@ -131,7 +145,7 @@ class AppTests(unittest.TestCase):
             config = {
                 'agent': {'model': {'name': 'test', 'provider': 'ollama', 'base_url': 'http://127.0.0.1:11434/v1'}},
                 'kvmcp': {'pc': {'url': 'http://127.0.0.1:9527/mcp', 'description': '测试电脑'}},
-                'speech': {'model': directory, 'vad_model': directory},
+                'voice': {'model': directory, 'vad_model': directory},
             }
             history = History(Path(directory))
             started, release, finished = Event(), Event(), Event()
@@ -146,7 +160,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
                 patch('chatkvm.speech.SpeechRecognizer', side_effect=load) as recognizer,
             ):
                 try:
@@ -169,11 +183,11 @@ class AppTests(unittest.TestCase):
         config = {
             'agent': {'model': {'name': 'test', 'provider': 'ollama', 'base_url': 'http://127.0.0.1:11434/v1'}},
             'kvmcp': {'pc': {'url': 'http://127.0.0.1:9527/mcp', 'description': '测试电脑'}},
-            'speech': {'model': 'models/SenseVoiceSmall', 'vad_model': 'models/fsmn-vad'},
+            'voice': {'model': 'models/SenseVoiceSmall', 'vad_model': 'models/fsmn-vad'},
         }
         with tempfile.TemporaryDirectory() as directory:
-            config['speech']['model'] = str(Path(directory) / 'model')
-            config['speech']['vad_model'] = str(Path(directory) / 'vad')
+            config['voice']['model'] = str(Path(directory) / 'model')
+            config['voice']['vad_model'] = str(Path(directory) / 'vad')
             history = History(Path(directory))
             conversation = history.create()
             chat_input = st.chat_input
@@ -190,7 +204,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)) as limits,
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
                 patch('streamlit.chat_input', side_effect=recorded_input),
                 patch('chatkvm.speech.SpeechRecognizer') as recognizer,
                 patch('chatkvm.agent.chat') as agent_chat,
@@ -199,7 +213,6 @@ class AppTests(unittest.TestCase):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py')).run(timeout=20)
                 app.chat_input[0].set_value('recording').run(timeout=20)
                 self.assertFalse(app.exception)
-                self.assertEqual(limits.call_count, 2)
                 self.assertEqual(app.chat_input[0].proto.value, '请\n查看屏幕')
                 self.assertTrue(app.chat_input[0].proto.set_value)
                 self.assertEqual(history.turns(conversation), [])
@@ -210,7 +223,7 @@ class AppTests(unittest.TestCase):
             config = {
                 'agent': {'model': {'name': 'test', 'provider': 'ollama', 'base_url': 'http://127.0.0.1:11434/v1'}},
                 'kvmcp': {'pc': {'url': 'http://127.0.0.1:9527/mcp', 'description': '测试电脑'}},
-                'speech': {'model': directory, 'vad_model': directory},
+                'voice': {'model': directory, 'vad_model': directory},
             }
             history = History(Path(directory))
             conversation = history.create()
@@ -228,7 +241,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
                 patch('streamlit.chat_input', side_effect=recorded_input),
                 patch('chatkvm.speech.SpeechRecognizer') as recognizer,
                 patch('chatkvm.agent.chat') as agent_chat,
@@ -266,7 +279,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py')).run(timeout=20)
                 self.assertFalse(app.exception)
@@ -294,22 +307,21 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py')).run(timeout=20)
                 self.assertFalse(app.exception)
                 self.assertEqual([tab.label for tab in app.sidebar.tabs], ['对话', '设置'])
                 self.assertIn('删除对话', [button.label for button in app.sidebar.button])
                 controls = app.get_by_key('chat_controls')
-                self.assertEqual([toggle.label for toggle in controls.toggle], ['操控', '思考', '前文'])
+                self.assertEqual([toggle.label for toggle in controls.toggle], ['操控', '思考', '上文'])
                 self.assertIn('3/100 pc 按键', [item.label for item in app.expander])
                 self.assertEqual(len(controls.selectbox), 1)
                 self.assertEqual(controls.selectbox[0].options, ['500', '250', '100', '50', '25'])
-                self.assertEqual(len(controls.caption), 2)
+                self.assertEqual(len(controls.caption), 1)
                 self.assertEqual(controls.caption[0].value, '上限')
                 self.assertFalse(controls.caption[0].proto.help)
-                self.assertEqual(controls.caption[1].value, '6.2%')
-                self.assertEqual(controls.caption[1].proto.help, '512 / 8,192 tokens')
+                self.assertIn('用时 1.5 秒  上下文 6.2%  512 / 8,192 tokens', [caption.value for caption in app.caption])
                 self.assertFalse(controls.toggle[0].proto.help)
                 self.assertFalse(app.session_state['thinking'])
                 self.assertFalse(app.session_state['include_history'])
@@ -324,9 +336,9 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(app.session_state['tool_limit'], 250)
                 self.assertEqual(app.session_state['active_chat'], conversation)
 
-    def test_switching_conversations_updates_usage_and_preserves_recorded_window(self):
+    def test_switching_conversations_updates_turn_usage_and_preserves_recorded_window(self):
         config = {
-            'agent': {'model': {'name': 'test', 'provider': 'ollama', 'base_url': 'http://127.0.0.1:11434/v1'}},
+            'agent': {'model': {'name': 'test', 'provider': 'ollama', 'base_url': 'http://127.0.0.1:11499/v1'}},
             'kvmcp': {'pc': {'url': 'http://127.0.0.1:9527/mcp', 'description': '测试电脑'}},
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -342,7 +354,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(131072, 262144)) as limits,
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen(runtime_context=None)),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py'))
                 app.session_state['active_chat'] = first
@@ -350,22 +362,16 @@ class AppTests(unittest.TestCase):
                 for conversation, percentage, tokens in [(first, '2.0%', '5,322'), (second, '2.4%', '6,276'), (first, '2.0%', '5,322')]:
                     app.radio(key='conversation_picker').set_value(conversation).run()
                     self.assertFalse(app.exception)
-                    usage = app.get_by_key('chat_controls').caption[1]
-                    self.assertEqual(usage.value, percentage)
-                    self.assertEqual(usage.proto.help, f'{tokens} / 262,144 tokens')
-                limits.return_value = (None, 262144)
+                    expected = f'用时 0.1 秒  上下文 {percentage}  {tokens} / 262,144 tokens'
+                    self.assertIn(expected, [caption.value for caption in app.caption])
                 app.run()
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '2.0%')
-                limits.return_value = (131072, 262144)
+                self.assertIn('用时 0.1 秒  上下文 2.0%  5,322 / 262,144 tokens', [caption.value for caption in app.caption])
                 app.radio(key='conversation_picker').set_value(empty).run()
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '0.0%')
+                self.assertEqual(app.get_by_key('chat_controls').caption[0].value, '上限')
 
                 history.append(empty, prompt='旧记录', response='完成', duration_ms=100, events=[], input_tokens=6276, include_history=False)
-                limits.return_value = (None, 262144)
                 app.run()
-                usage = app.get_by_key('chat_controls').caption[1]
-                self.assertEqual(usage.value, '2.4%')
-                self.assertEqual(usage.proto.help, '6,276 / 262,144 tokens')
+                self.assertIn('用时 0.1 秒  上下文 2.4%  6,276 / 262,144 tokens', [caption.value for caption in app.caption])
 
     def test_previous_context_toggle_only_changes_model_input_not_saved_history(self):
         config = {
@@ -390,7 +396,7 @@ class AppTests(unittest.TestCase):
                 patch('sys.argv', ['app.py']),
                 patch('chatkvm.config.read_config', return_value=config),
                 patch('chatkvm.history.History', return_value=history),
-                patch('chatkvm.model_info.ollama_context_limits', return_value=(8192, 262144)),
+                patch('urllib.request.urlopen', side_effect=ollama_urlopen()),
                 patch('chatkvm.agent.chat', side_effect=run_agent),
             ):
                 app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'src/chatkvm/app.py')).run(timeout=20)
@@ -400,22 +406,20 @@ class AppTests(unittest.TestCase):
                     self.assertFalse(app.exception)
                 self.assertEqual(seen_contexts, [0, 0])
                 self.assertEqual(len(history.context(conversation)), 4)
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '1.2%')
+                self.assertTrue(any('上下文 1.2%  100 / 8,192 tokens' in caption.value for caption in app.caption))
 
                 app.toggle(key='include_history').set_value(True).run()
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '—')
                 app.chat_input[0].set_value('第三轮').run(timeout=20)
                 self.assertFalse(app.exception)
                 self.assertEqual(seen_contexts, [0, 0, 4])
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '4.9%')
+                self.assertTrue(any('上下文 4.9%  400 / 8,192 tokens' in caption.value for caption in app.caption))
 
                 app.toggle(key='include_history').set_value(False).run()
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '—')
                 app.chat_input[0].set_value('第四轮').run(timeout=20)
                 self.assertFalse(app.exception)
                 self.assertEqual(seen_contexts, [0, 0, 4, 0])
                 self.assertEqual(len(history.context(conversation)), 8)
-                self.assertEqual(app.get_by_key('chat_controls').caption[1].value, '1.2%')
+                self.assertTrue(any('上下文 1.2%  100 / 8,192 tokens' in caption.value for caption in app.caption))
                 self.assertEqual([turn['include_history'] for turn in history.turns(conversation)], [False, False, True, False])
 
 

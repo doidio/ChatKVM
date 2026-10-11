@@ -41,7 +41,7 @@ AGENT_INSTRUCTIONS = """你是 ChatKVM，通过工具观察和操作多台目标
 依据工具返回的全屏截图观察和操作。放大图用于辨认画面；鼠标坐标始终使用截图注明的采集原图像素尺寸。光标遮挡目标时，先移开光标并重新截图。
 识别界面文字时按画面原样判断；局部被截断或新画面与旧判断冲突时，补看完整画面，以新证据修正结论，不凭猜测补全。
 每次键鼠操作前，依据当前画面确认目标状态、焦点等操作前提；操作后查看画面，确认落点和结果。使用带坐标的工具前，根据最新截图定位目标内部落点，不沿用界面变化前的坐标；光标未落在目标上时重新定位，落点正确但无预期变化时检查界面响应、焦点或交互方式，不在同一位置反复试错。静态画面未必能证明焦点；输入长文本时，若分段不会触发副作用，可先发送一小段原文，确认出现后再继续。
-type_text 按设备配置键入，无法输入的字符会跳过并列明。按键已发送不代表文本进入了目标控件；未显示时先检查焦点和落点，再判断输入方式是否不支持。同一设备的操作应串行进行。
+type_text 按设备端配置键入，无法输入的字符会跳过并列明。按键已发送不代表文本进入了目标控件；未显示时先检查焦点和落点，再判断设备是否支持该字符。同一设备的操作应串行进行。
 只执行用户授权的操作。操作指令发送成功后仍需观察结果；失败或状态不明时先确认当前状态，再决定下一步。"""
 
 def resolve_model(config: dict) -> Model | str:
@@ -383,9 +383,8 @@ def build_agent(model: Model | str, *, allow_control: bool, thinking: bool = Fal
             _record(ctx, 'type_text', device_id, arguments, started, error)
             return error
         try:
-            method = ctx.deps.devices.text_input_method(device_id)
-            timeout = max(30, len(text) * (0.25 if method == 'windows_gbk' else 0.06) + 20)
-            result = _text(await ctx.deps.devices.call(device_id, 'type_text', text=text, method=method, read_timeout_seconds=timeout))
+            timeout = max(30, len(text) * 0.25 + 20)
+            result = _text(await ctx.deps.devices.call(device_id, 'type_text', text=text, read_timeout_seconds=timeout))
         except DeviceError as exc:
             result = f'{exc}；部分字符可能已输入，请先截图核对。'
             _record(ctx, 'type_text', device_id, arguments, started, result)

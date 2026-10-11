@@ -2,20 +2,6 @@
 
 > 安全内网下 AI 自主看屏幕操控电脑
 
-## 语音输入
-
-安装语音依赖 `uv sync --extra voice`（PyTorch 保留 GPU 支持，识别使用 CPU），运行 `uv run --extra voice scripts/download-speech-models.py` 将 SenseVoiceSmall 和 FSMN-VAD 完整下载到本地，在 `config.toml` 中设置路径（相对于配置文件）：
-
-```toml
-[speech]
-model = "models/SenseVoiceSmall"
-vad_model = "models/fsmn-vad"
-```
-
-输入框中的麦克风可录制最长 120 秒的语音，CPU 离线识别后填回输入框，确认或修改文字后再发送。录音不写入对话历史；页面打开时后台预加载模型，跨对话复用，不阻塞文字聊天。删除 `[speech]` 可关闭语音输入。
-
-浏览器需允许麦克风权限，并通过受信任的 HTTPS 或访问者设备自己的 `localhost` 打开页面；`http://100.64.x.x:8501` 不满足远程录音要求。
-
 ### 内网 HTTPS 部署
 
 以下是已在 Ubuntu 主机 `100.64.0.1` 和 Windows Edge 验证的私有 CA 方案。证书中的域名和 IP、[Nginx 配置](scripts/nginx-chatkvm.conf)中的监听地址及域名都要按实际部署修改。私有 CA 不依赖公网续签，但每台访问设备都必须信任它。
@@ -73,9 +59,3 @@ vad_model = "models/fsmn-vad"
 在已信任 CA 的 Windows Edge 中，`https://100.64.0.1/` 页面已验证可正常打开；iPhone 上的麦克风录音与识别仍需在该设备上实测。
 
 域名访问还取决于客户端 DNS：联网时可使用指向虚拟网 IP 的公网 A 记录，完全离线时需自建内网 DNS 或配置 hosts。部分代理的假 IP DNS 也会影响解析。网站证书到期前要用保留的 CA 私钥重新签发并替换服务器证书；本方案不在服务器保存 CA 私钥，也不自动续签。
-
-## 文本输入
-
-Agent 只使用 `type_text` 向当前焦点键入文本，不调用目标电脑的命令行或剪贴板。默认采用美式键盘 ASCII 输入；在已验证的简体中文 Windows 目标设备上，可在对应的 `[kvmcp."设备名"]` 配置中设置 `text_input = "windows_gbk"`。该模式通过 HID 数字小键盘 Alt 编码输入 GBK 字符，换行和制表符使用物理按键，不依赖中文输入法。
-
-工具逐字符处理文本，跳过无法编码的字符并返回其位置；发送途中失败则停止，已发送的部分可能留在目标窗口。键入前确认焦点，键入后核对内容。GBK 模式需在目标系统和实际软件中验证，不能保证支持所有 Unicode 字符或文本控件。
